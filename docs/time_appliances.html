@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>GPS Time Appliances — Firmware and Timing Architecture</title>
+<style>
+@page { size: Letter; margin: 0.65in 0.7in 0.7in; @bottom-right { content: "Page " counter(page); color:#64748b; font-size:9pt; } }
+* { box-sizing:border-box; }
+body { font-family: Arial, Helvetica, sans-serif; color:#172033; font-size:10pt; line-height:1.42; }
+h1 { color:#0b3558; font-size:28pt; margin:0 0 8pt; line-height:1.08; }
+h2 { color:#0b557f; font-size:17pt; border-bottom:2px solid #8ecae6; padding-bottom:4pt; margin:22pt 0 9pt; page-break-after:avoid; }
+h3 { color:#174a6e; font-size:12pt; margin:14pt 0 4pt; page-break-after:avoid; }
+p { margin:5pt 0 8pt; }
+ul, ol { margin-top:4pt; padding-left:20pt; }
+li { margin:3pt 0; }
+.cover { min-height:8.7in; display:flex; flex-direction:column; justify-content:center; page-break-after:always; }
+.subtitle { color:#42627a; font-size:15pt; margin-bottom:26pt; }
+.badge { display:inline-block; background:#e2f2fa; color:#0b557f; padding:5pt 9pt; border-radius:4pt; font-weight:bold; margin:3pt 4pt 3pt 0; }
+.note, .warning, .result { padding:9pt 11pt; border-left:4px solid #2383b5; background:#eef8fc; margin:9pt 0; }
+.warning { border-color:#d97706; background:#fff7e8; }
+.result { border-color:#16805a; background:#edf9f3; }
+table { width:100%; border-collapse:collapse; margin:8pt 0 12pt; font-size:9pt; }
+th { background:#0b557f; color:white; text-align:left; padding:6pt; }
+td { border:1px solid #cbd5e1; padding:5pt 6pt; vertical-align:top; }
+tr:nth-child(even) td { background:#f6fafc; }
+code { font-family: "Courier New", monospace; color:#173f5f; background:#f1f5f9; padding:1pt 3pt; }
+pre { background:#172033; color:#e5f2f9; padding:9pt 11pt; border-radius:4pt; font-size:8.5pt; white-space:pre-wrap; }
+.flow { display:flex; align-items:stretch; gap:5pt; margin:10pt 0 14pt; }
+.box { flex:1; border:1px solid #8ecae6; background:#f3fbfe; padding:7pt; text-align:center; border-radius:4pt; }
+.arrow { align-self:center; color:#0b557f; font-size:16pt; font-weight:bold; }
+.small { font-size:8.5pt; color:#526579; }
+.two { display:grid; grid-template-columns:1fr 1fr; gap:12pt; }
+.toc { columns:2; column-gap:30pt; }
+.toc li { break-inside:avoid; }
+.keep { page-break-inside:avoid; }
+.footer-note { color:#64748b; font-size:8.5pt; margin-top:18pt; }
+</style>
+</head>
+<body>
+<section class="cover">
+  <div><span class="badge">Firmware 0.4.0</span><span class="badge">Pico 2 W / RP2350</span><span class="badge">L76K + u-blox variants</span></div>
+  <h1>GPS Time Appliances</h1>
+  <div class="subtitle">Firmware, timing architecture, synchronization logic, and operational behavior</div>
+  <p>This document describes the current time-server firmware in the project <code>pico_gps_l76k</code>. It covers the L76K NMEA appliance and the u-blox NEO-F10N UBX appliance, which share the same Pico hardware and timing engine but use different GPS message paths.</p>
+  <div class="result"><b>Executive summary.</b> GPS supplies UTC identity and navigation data; the GPS 1-PPS edge supplies the precise repeating timing reference. A PIO hardware counter and DMA capture PPS intervals without depending on CPU interrupt latency. An alpha-beta servo estimates the PPS period and its slow drift, while the Pico creates a continuous high-resolution timebase used by the NTP server, dashboard, RTC logic, and display.</div>
+  <p class="small">Prepared from the current source tree and deployed firmware behavior on September 3, 2026.</p>
+</section>
+
+<h2>1. System at a glance</h2>
+<div class="flow">
+  <div class="box"><b>GPS receiver</b><br>UTC messages<br>1-PPS edge</div><div class="arrow">→</div>
+  <div class="box"><b>Pico 2 W</b><br>PIO + DMA capture<br>alpha-beta discipline</div><div class="arrow">→</div>
+  <div class="box"><b>Time services</b><br>NTP stratum 1<br>HTTP dashboard</div>
+</div>
+<p>The two information streams have different jobs:</p>
+<table><tr><th>Input</th><th>What it tells the firmware</th><th>Timing quality</th></tr>
+<tr><td>GPS serial messages</td><td>UTC date/time, fix validity, satellites, DOP, position, and (depending on variant) message-specific timing metadata.</td><td>Delayed by receiver scheduling and UART transmission; useful for UTC labeling, not ideal for the exact edge.</td></tr>
+<tr><td>GPS 1-PPS</td><td>One physical edge per second that identifies the precise second boundary.</td><td>Primary live timing reference; captured in hardware.</td></tr>
+<tr><td>RTC SQW</td><td>Local 1 Hz backup edge from the DS3231.</td><td>Used for holdover only after it has been aligned and trusted.</td></tr></table>
+
+<h2>2. Hardware and firmware variants</h2>
+<table><tr><th>Item</th><th>L76K firmware</th><th>u-blox firmware</th></tr>
+<tr><td>GPS protocol</td><td>NMEA text</td><td>UBX binary messages</td></tr>
+<tr><td>Default serial pins</td><td>TX GP0, RX GP1</td><td>TX GP0, RX GP1</td></tr>
+<tr><td>GPS serial speed</td><td>Starts at 9,600 baud, configures receiver, then uses 115,200 baud</td><td>38,400 baud in the deployed image</td></tr>
+<tr><td>PPS input</td><td>GP16</td><td>GP16</td></tr>
+<tr><td>RTC I²C</td><td colspan="2">SDA GP4, SCL GP5, address 0x68</td></tr>
+<tr><td>RTC 1 Hz SQW</td><td colspan="2">GP17</td></tr>
+<tr><td>Display</td><td colspan="2">TM1637 CLK GP14, DIO GP15</td></tr>
+<tr><td>Network</td><td colspan="2">Pico 2 W Wi-Fi, DHCP, HTTP port 80, NTP/UDP port 123</td></tr></table>
+<p>Both deployed images use a 50 MHz PPS capture counter, endless DMA capture, debug logging disabled, and the HTTP dashboard enabled by default.</p>
+
+<h2>3. Startup and task ownership</h2>
+<p>At startup the firmware initializes the clocks, GPIO, RTC, GPS UART, PIO PPS capture, Wi-Fi, NTP server, HTTP server, and the high-resolution timebase. The Pico launches the second core so networking does not have to share the main GPS/timing loop.</p>
+<div class="two">
+<div class="keep"><h3>Core 0 — timing and device control</h3><ul><li>Services GPS UART input and parses complete NMEA lines or UBX frames.</li><li>Polls the PPS DMA ring and consumes hardware-captured counter values.</li><li>Runs the PPS interval calculations and alpha-beta servo.</li><li>Updates UTC snapshots, RTC state, holdover logic, leap cache, and display state.</li><li>Feeds the watchdog.</li></ul></div>
+<div class="keep"><h3>Core 1 — network and Wi-Fi</h3><ul><li>Runs the CYW43 Wi-Fi driver polling loop.</li><li>Maintains the station connection and retry backoff.</li><li>Services lwIP TCP/IP processing.</li><li>Answers NTP requests and HTTP dashboard requests.</li><li>Updates the network LED output based on shared timing state.</li></ul></div>
+</div>
+<p>Shared state is protected with the firmware’s statistics mutex or atomic counters. The network side reads a coherent health snapshot rather than directly racing the timing calculations.</p>
+
+<h2>4. GPS serial processing</h2>
+<h3>L76K NMEA path</h3>
+<p>The L76K path collects UART bytes into bounded line buffers. At a newline, the line is queued with the high-resolution timestamp of its first byte. Checksum validation and sentence parsing then update GPS statistics.</p>
+<ul><li><code>RMC</code> supplies UTC time/date, validity, speed, and position.</li><li><code>GGA</code> supplies fix quality, satellites, altitude, and DOP data.</li><li><code>GSA</code>/<code>GSV</code> supply additional constellation and satellite information, subject to what the L76K reports.</li></ul>
+<p>The firmware configures the L76K with PCAS commands: it trims unwanted output, changes the receiver baud rate, and leaves the desired NMEA output enabled.</p>
+<h3>u-blox UBX path</h3>
+<p>The UBX path feeds bytes into a checksum-validated binary frame parser. The deployed configuration enables these one-Hz messages on the receiver UART:</p>
+<table><tr><th>Message</th><th>Purpose</th></tr><tr><td>UBX-NAV-PVT</td><td>Validated UTC date/time, fix type, position, DOP, and navigation solution.</td></tr><tr><td>UBX-TIM-TP</td><td>Time-pulse metadata and timing quality information.</td></tr><tr><td>UBX-NAV-SAT</td><td>Total/used satellite counts by constellation, including GPS, Galileo, BeiDou, GLONASS, QZSS, and SBAS.</td></tr></table>
+<p>The physical TIMEPULSE/PPS edge remains the high-precision reference. UBX serial data validates and labels that edge; it does not replace the edge capture.</p>
+
+<h2>5. PPS capture: PIO and DMA</h2>
+<p>The PPS input is connected to a PIO state machine. The PIO maintains a free-running 32-bit down-counter and captures its value on each rising PPS edge. Each captured value is pushed into the PIO FIFO. DMA transfers the FIFO values into a 16-entry ring buffer without requiring a CPU interrupt for every edge.</p>
+<pre>GPS PPS rising edge
+        │
+        ▼
+PIO state machine: free-running counter → capture counter value → FIFO
+                                                        │
+                                                        ▼
+                                      DMA endless ring buffer (16 samples)
+                                                        │
+                                                        ▼
+                                      Core 0 consumes captured timestamps</pre>
+<p>At a configured 50 MHz counter rate, one counter tick represents 20 ns. The capture is therefore independent of the variable delay that would occur if the CPU timestamped the GPIO interrupt in software. DMA overrun count is exposed in the dashboard and is currently zero on both deployed devices.</p>
+<div class="warning"><b>Important distinction:</b> PPS capture measures the interval between receiver edges. It does not by itself prove the absolute UTC phase of an edge. An interval that is 4 µs shorter than one second is a period/frequency observation, not proof that the edge is 4 µs late.</div>
+
+<h2>6. Alpha-beta time discipline</h2>
+<p>The servo is an estimator, not a step-by-step clock reset. It tracks two state variables:</p>
+<ul><li><b>Period estimate:</b> the learned duration of one PPS interval.</li><li><b>Period-rate estimate:</b> the slow change in that duration, representing oscillator drift.</li></ul>
+<p>For each accepted interval, the servo predicts the next period, computes the innovation, and applies two corrections:</p>
+<pre>prediction  = learned_period + learned_period_rate
+innovation  = measured_interval - prediction
+period      += innovation / 8
+rate        += innovation / 64</pre>
+<p>The deployed gains are alpha = 1/8 and beta = 1/64. Alpha responds to phase/period discrepancies relatively quickly; beta changes the frequency estimate more slowly so the servo does not chase individual PPS noise.</p>
+<h3>Median and MAD rejection</h3>
+<p>A five-sample history is maintained. Once enough samples exist, the incoming interval is compared with the median. A sample is rejected when its residual exceeds <code>max(50,000 ns, 6 × MAD)</code>. Rejected samples do not update the servo. This protects the estimate from a missed edge, a malformed capture, or a transient measurement.</p>
+<h3>What the measurements mean</h3>
+<table><tr><th>Dashboard field</th><th>Meaning</th></tr><tr><td>Period</td><td>Current alpha-beta learned PPS interval.</td></tr><tr><td>Frequency estimate</td><td>Estimated change in interval per second, in ns/s.</td></tr><tr><td>Period error</td><td>Most recent measured interval minus exactly 1,000,000,000 ns. This is not absolute PPS lateness.</td></tr><tr><td>Jitter RMS</td><td>Residual interval variation around the learned median interval. A stable period bias is excluded.</td></tr><tr><td>Servo innovation</td><td>Difference between the new measurement and the servo prediction.</td></tr><tr><td>MAD / reject threshold</td><td>Robust spread estimate and the threshold used for outlier rejection.</td></tr></table>
+
+<h2>7. High-resolution software time and UTC labeling</h2>
+<p>The RP2350 DWT cycle counter is used for a high-resolution monotonic timebase. It is anchored to the SDK microsecond clock and periodically re-anchored. This provides fine-grained timestamps for PPS, serial arrival, NTP receive/transmit processing, and internal scheduling.</p>
+<p>The GPS message establishes the UTC date and second number. The next appropriate PPS edge is associated with that UTC second. After that, each PPS increments the UTC epoch by one second while the high-resolution clock supplies the fraction between edges.</p>
+<p>The result is a continuous software clock:</p>
+<pre>UTC timestamp = GPS UTC epoch label + disciplined sub-second time from PPS</pre>
+<p>The GPS serial message is deliberately treated as delayed data. RMC-to-PPS latency is measured and learned for acceptance decisions, but UART delivery delay is not used as the PPS edge timestamp.</p>
+
+<h2>8. RMC/NAV message acceptance</h2>
+<p>GPS time is accepted only when the navigation data meets configured quality checks such as fix quality, satellite count, HDOP limits where available, checksum validity, and freshness. The RMC-to-PPS window protects against pairing a message from the wrong second with a PPS edge.</p>
+<p>The window starts permissive during bootstrap so the firmware can learn the receiver’s normal UART delay. Once the delay is consistent, the window tightens toward the accuracy-mode limit of 20,000 µs. This window concerns serial message alignment; it is not the PPS accuracy.</p>
+
+<h2>9. RTC synchronization and holdover</h2>
+<p>The DS3231 is a secondary time source and backup oscillator. GPS/PPS remains primary while valid.</p>
+<ol><li>GPS UTC and PPS establish the live time.</li><li>The RTC is periodically synchronized rather than rewritten on every PPS edge.</li><li>The RTC aging register is adjusted using a long-window drift estimate to avoid reacting to short-term noise.</li><li>The SQW/1 Hz output is measured against GPS PPS. It must show multiple good aligned edges and approximately one minute of stable PPS before being trusted for holdover.</li><li>If GPS disappears, the RTC SQW can provide the one-second holdover tick. The firmware returns to GPS/PPS when it becomes valid again.</li></ol>
+<p>GPS holdover begins after the configured GPS quality timeout (10 seconds by default). SQW trust requires four good edges and a 60-tick settling period. A large RTC phase error can trigger a scheduled rephase; this is separate from the live PPS servo.</p>
+
+<h2>10. Leap seconds and UTC policy</h2>
+<p>The firmware uses the IANA leap-seconds list. It first checks the RTC EEPROM cache and fetches the network copy when the cache is missing, invalid, or expired. Parsed metadata is stored back to EEPROM. The deployed network-facing policy is a linear 24-hour smear before a listed leap event.</p>
+<ul><li>GPS input is treated as the UTC identity source.</li><li>NTP timestamps and the display apply the configured smear policy when applicable.</li><li>The dashboard reports whether leap data is loaded, its source, expiration, and next event.</li></ul>
+
+<h2>11. NTP server</h2>
+<p>The Pico listens on UDP port 123 and serves NTP client-mode requests. It timestamps receive and transmit processing with the disciplined high-resolution clock, returns the current source quality, and reports PPS as stratum 1 when PPS is valid.</p>
+<table><tr><th>Quality</th><th>Use</th></tr><tr><td>PPS</td><td>Primary: GPS UTC label plus PPS-disciplined sub-second time.</td></tr><tr><td>RTC SQW</td><td>Secondary holdover when GPS/PPS is unavailable but SQW is trusted.</td></tr><tr><td>Coarse GPS/RTC</td><td>Fallback only when a valid source exists without a trusted PPS/SQW edge.</td></tr><tr><td>None</td><td>No synchronized time available.</td></tr></table>
+<p>Malformed packets, rate-limited requests, send errors, request counts, and network reconnects are counted and shown in the health JSON. The configured request limit is 20 NTP requests per second.</p>
+
+<h2>12. HTTP dashboard and diagnostics</h2>
+<p>The HTTP server is enabled by default on port 80. The dashboard polls <code>/api/health</code> approximately once per second and includes a timeout plus overlap protection so a slow request cannot create an unlimited queue of browser requests.</p>
+<p>The health endpoint exposes GPS, PPS, servo, RTC, leap, Wi-Fi, NTP, HTTP, and watchdog-relevant counters. The most important timing fields are:</p>
+<table><tr><th>Field</th><th>Interpretation</th></tr><tr><td><code>synced=true</code>, <code>clock_state=LOCKED</code></td><td>UTC time is currently valid and the clock is locked.</td></tr><tr><td><code>sntp_quality=PPS</code>, <code>sntp_stratum=1</code></td><td>NTP is serving GPS/PPS-disciplined time.</td></tr><tr><td><code>pps=true</code></td><td>A recent PPS edge was received.</td></tr><tr><td><code>ab_servo_valid=true</code></td><td>The alpha-beta estimator has initialized.</td></tr><tr><td><code>accuracy_mode=true</code></td><td>Recent PPS residuals meet the configured stability thresholds.</td></tr><tr><td><code>pps_dma_overruns=0</code></td><td>The capture ring has not overflowed.</td></tr></table>
+
+<h2>13. Current observed performance</h2>
+<p>The following values were observed live after flashing the updated images. They are a snapshot, not a permanent specification.</p>
+<table><tr><th>Metric</th><th>L76K</th><th>u-blox</th></tr><tr><td>UTC source/state</td><td>GPS/PPS, LOCKED</td><td>GPS/PPS, LOCKED</td></tr><tr><td>Servo</td><td>TRACKING, valid</td><td>TRACKING, valid</td></tr><tr><td>Residual jitter RMS</td><td>15 ns</td><td>20 ns</td></tr><tr><td>Period error</td><td>about −4,020 ns</td><td>about +160 ns</td></tr><tr><td>Servo innovation</td><td>about +20 ns</td><td>about +6 ns</td></tr><tr><td>Rejected samples / DMA overruns</td><td>0 / 0</td><td>0 / 0</td></tr><tr><td>NTP quality</td><td>PPS, stratum 1</td><td>PPS, stratum 1</td></tr></table>
+<p>The L76K period error is a stable interval characteristic relative to the ideal one-second value. Its low residual jitter and low servo innovation show that the servo is tracking it. The u-blox has a period closer to nominal in this snapshot, while both have stable PPS residuals.</p>
+
+<h2>14. Practical troubleshooting guide</h2>
+<table><tr><th>Symptom</th><th>Likely area</th><th>First checks</th></tr><tr><td>PPS absent</td><td>Wiring or receiver configuration</td><td>Confirm GP16, common ground, signal level, rising edge, receiver lock, and <code>pps_age_ms</code>.</td></tr><tr><td>PPS present but no UTC lock</td><td>Message/PPS association</td><td>Check RMC/NAV freshness, checksum errors, fix quality, RMC window, and receiver baud.</td></tr><tr><td>Large period error but low jitter</td><td>Receiver/counter frequency relationship</td><td>Compare Period Error with learned Period, Frequency Estimate, and Servo Innovation; do not call it absolute PPS delay.</td></tr><tr><td>Jitter suddenly large</td><td>Capture or signal integrity</td><td>Check DMA overruns, PPS edge quality, counter configuration, and outlier count.</td></tr><tr><td>RTC used unexpectedly</td><td>GPS timeout or quality failure</td><td>Check GPS age, PPS age, clock state, RTC state, and GPS rejection counters.</td><tr><td>Dashboard red/disconnected</td><td>HTTP/TCP resource or Wi-Fi path</td><td>Refresh, inspect HTTP errors/reconnects, then test spaced requests and network signal.</td></tr></table>
+
+<h2>15. Configuration summary</h2>
+<table><tr><th>Setting</th><th>Current deployed value</th></tr><tr><td>PPS capture</td><td>PIO + endless DMA, 50 MHz counter, 16-entry ring</td></tr><tr><td>Alpha / beta</td><td>1/8 and 1/64</td></tr><tr><td>Median history</td><td>5 intervals</td></tr><tr><td>Outlier floor</td><td>50,000 ns</td></tr><tr><td>Jitter window</td><td>60 samples</td></tr><tr><td>PPS missing timeout</td><td>1.5 seconds for present/absent indication</td></tr><tr><td>GPS holdover timeout</td><td>10 seconds</td></tr><tr><td>Accuracy mode</td><td>Enabled; 3 µs RMS and 8 µs peak thresholds, 30 minimum samples</td></tr><tr><td>Debug logging</td><td>Disabled in deployed images</td></tr><tr><td>HTTP dashboard</td><td>Enabled by default</td></tr></table>
+
+<h2>16. Bottom line</h2>
+<div class="result"><b>The architecture is sound for a network time appliance:</b> serial GPS data supplies UTC identity, hardware PPS supplies the second boundary, PIO/DMA removes CPU interrupt latency from the measurement, and the alpha-beta servo maintains a continuous clock between edges. The RTC provides disciplined backup holdover, while the NTP and HTTP services consume snapshots of that timing state.</div>
+<p>The most important diagnostic rule is to keep three concepts separate: <b>period error</b> is deviation from an ideal one-second interval, <b>jitter</b> is short-term variation around the learned interval, and <b>absolute UTC phase</b> requires an independent timing comparison. The current dashboard now reports the first two separately and exposes servo innovation to make that distinction visible.</p>
+<p class="footer-note">This document intentionally omits network credentials. Pin assignments and defaults are documented from the current source; compile-time overrides remain possible through CMake definitions.</p>
+</body></html>

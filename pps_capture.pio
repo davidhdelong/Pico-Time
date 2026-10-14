@@ -1,0 +1,21 @@
+; PPS capture: maintain a free-running counter and latch its value on
+; each rising edge. Steady low/high loops use two clocks per decrement.
+; Capture/falling paths add SIX clocks per complete pulse, and X underflow
+; adds ONE clock. pps_capture_timing.h accounts for these; keep them in sync.
+; PUSH may stall on a full FIFO: host recovery must discard that timebase.
+.program pps_capture
+    mov x, ~null
+loop:
+    jmp pin, capture
+    jmp x--, loop
+    jmp loop
+capture:
+    mov isr, x
+    push block
+    irq 0
+high:
+    jmp pin, high_dec
+    jmp loop
+high_dec:
+    jmp x--, high
+    jmp high

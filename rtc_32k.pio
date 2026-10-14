@@ -1,0 +1,18 @@
+; One report per 32768 rising edges. CPU receives ~1 IRQ/s, not 32768.
+; Independent of duty cycle. X is a wrapping report sequence for loss detection.
+.program rtc_32k
+    pull block
+    mov x, ~null
+.wrap_target
+    mov y, osr
+count:
+    wait 0 pin 0
+    wait 1 pin 0
+    jmp y-- count
+    mov isr, x
+    push noblock
+    irq 0
+    jmp x-- report_done
+report_done:
+    nop
+.wrap

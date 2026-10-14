@@ -1,0 +1,15 @@
+build/
+build-*/
+cmake-build-*/
+*.elf
+*.bin
+*.hex
+*.uf2
+*.map
+*.dis
+*.su
+__pycache__/
+tools/timezone_generator/*.zip
+.env
+.env.*
+!.env.example

@@ -1,0 +1,185 @@
+cmake_minimum_required(VERSION 3.13)
+
+include(pico_sdk_import.cmake)
+
+project(pico_gps_l76k C CXX ASM)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
+
+pico_sdk_init()
+
+add_executable(pico_gps_l76k
+    main.c
+    rtc_holdover.c
+    rtc_32k.c
+    ntp_uncertainty.c
+    tm1637.c
+    ubx.c
+    timezone_lookup.c
+    generated/timezone_data.c
+)
+
+target_include_directories(pico_gps_l76k PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}
+)
+
+if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    # Keep stack evidence for the health/uncertainty formatter and network path.
+    target_compile_options(pico_gps_l76k PRIVATE -fstack-usage)
+endif()
+
+# Core0 nests timing/filter work with UART ISR parsing. Core1 uses an explicit
+# 8 KiB main-RAM stack below; the old 2 KiB default cannot hold HTTP diagnostics.
+target_compile_definitions(pico_gps_l76k PRIVATE PICO_STACK_SIZE=0x1000 PICO_CORE1_STACK_SIZE=0x800)
+
+pico_generate_pio_header(pico_gps_l76k ${CMAKE_CURRENT_LIST_DIR}/pps_capture.pio)
+pico_generate_pio_header(pico_gps_l76k ${CMAKE_CURRENT_LIST_DIR}/rtc_32k.pio)
+
+set(OPTIONAL_DEFINES
+    GPS_PROTOCOL_UBX
+    FIRMWARE_VERSION
+    GPS_UART_ID
+    GPS_UART_TX_PIN
+    GPS_UART_RX_PIN
+    GPS_UART_BAUD
+    GPS_UART_BOOT_BAUD
+    GPS_CONFIGURE_MODULE
+    GPS_PPS_PIN
+    PPS_CAPTURE_COUNTER_HZ
+    PPS_CAPTURE_DMA
+    PPS_AB_ALPHA_SHIFT
+    PPS_AB_BETA_SHIFT
+    PPS_MEDIAN_WINDOW
+    PPS_OUTLIER_FLOOR_NS
+    TM1637_ENABLE
+    TM1637_CLK_PIN
+    TM1637_DIO_PIN
+    TM1637_BRIGHTNESS
+    GPS_HOLDOVER_TIMEOUT_MS
+    GPS_QUALITY_MAX_AGE_MS
+    GPS_NMEA_TIME_OFFSET_SEC
+    RTC_I2C_ID
+    RTC_32KHZ_GPIO
+    RTC_PHASE_DISCOVERY_NS
+    RTC_PHASE_MAX_OFFSET_NS
+    RTC_PHASE_MAX_JITTER_NS
+    RTC_PHASE_OUTLIER_FLOOR_NS
+    RTC_PHASE_MIN_SAMPLES
+    RTC_FREQUENCY_UNCERTAINTY_PPM
+    RTC_HOLDOVER_MAX_ERROR_NS
+    RTC_HOLDOVER_MAX_DURATION_S
+    RTC_HOLDOVER_MARGIN_NS
+    RTC_AGING_PPM_PER_LSB
+    RTC_AGING_MAX_UNCERTAINTY_PPM
+    GNSS_RECOVERY_GOOD_PULSES
+    UTC_MAX_SLEW_PPM
+    RTC_SDA_PIN
+    RTC_SCL_PIN
+    RTC_I2C_BAUD
+    RTC_SQW_PIN
+    RTC_SQW_PRESENT_TIMEOUT_US
+    RTC_SQW_MIN_US
+    RTC_SQW_MAX_US
+    RTC_SQW_PLL_FILTER_SHIFT
+    RTC_SQW_ALIGN_MAX_US
+    RTC_SQW_HOLDOVER_MAX_PHASE_US
+    RTC_SQW_GOOD_EDGES
+    RTC_SQW_PPS_SETTLE_TICKS
+    RTC_SQW_REPHASE_INTERVAL_MS
+    RTC_SET_BIAS_MAX_US
+    RTC_SYNC_INTERVAL_MS
+    RTC_SYNC_EXTENDED_MS
+    RTC_SYNC_MAX_OFFSET_SEC
+    RTC_SYNC_FORCE_SET_SEC
+    RTC_SYNC_FORCE_SET_PHASE_US
+    RTC_AGING_ENABLE
+    RTC_AGING_MAX_STEP
+    RTC_AGING_INVERT
+    RTC_AGING_WINDOW_SEC
+    RTC_AGING_MIN_SAMPLES
+    RMC_PPS_MAX_OFFSET_US
+    RMC_PPS_MIN_OFFSET_US
+    RMC_PPS_MARGIN_US
+    RMC_PPS_STD_MULT
+    RMC_PPS_EMA_SHIFT
+    RMC_MIN_FIX_QUALITY
+    RMC_MAX_HDOP
+    RMC_MIN_SATS
+    PPS_PLL_FILTER_SHIFT
+    PPS_PLL_MIN_US
+    PPS_PLL_MAX_US
+    PPS_JITTER_WINDOW
+    PPS_PRESENT_TIMEOUT_US
+    ACCURACY_MODE
+    ACCURACY_PPS_RMS_US
+    ACCURACY_PPS_PEAK_US
+    ACCURACY_PPS_MIN_SAMPLES
+    ACCURACY_PLL_FILTER_SHIFT
+    ACCURACY_PLL_SHIFT_RMS_T1
+    ACCURACY_PLL_SHIFT_RMS_T2
+    ACCURACY_PLL_SHIFT_RMS_T3
+    ACCURACY_RMC_MAX_WINDOW_US
+    ACCURACY_RMC_RMS_MULT
+    ACCURACY_RMC_RMS_MARGIN_US
+    RMC_PPS_MIN_CONSISTENT
+    RMC_PPS_BOOTSTRAP_SAMPLES
+    RMC_PPS_BOOTSTRAP_MAX_OFFSET_US
+    HEALTH_BROADCAST_ENABLE
+    HEALTH_BROADCAST_PORT
+    HEALTH_BROADCAST_CRC
+    HTTP_SERVER_ENABLE
+    HTTP_SERVER_PORT
+    LEAPFILE_ENABLE
+    LEAPFILE_HOST
+    LEAPFILE_PATH
+    LEAPFILE_REFRESH_DAYS
+    LEAPFILE_MAX_BYTES
+    RTC_EEPROM_ENABLE
+    RTC_EEPROM_ADDR
+    RTC_EEPROM_PAGE_SIZE
+    RTC_EEPROM_WRITE_DELAY_MS
+    LEAP_CACHE_EEPROM_OFFSET
+    GPS_LINE_QUEUE_SIZE
+    HIRES_REANCHOR_US
+    RTC_CACHE_POLL_MS
+    RTC_LOCK_GOOD_COUNT
+    RTC_FAULT_BAD_COUNT
+    WIFI_SSID
+    WIFI_PASSWORD
+    WIFI_AUTH
+    WIFI_CONNECT_TIMEOUT_MS
+    WIFI_RETRY_MIN_MS
+    WIFI_RETRY_MAX_MS
+    SNTP_MAX_REQUESTS_PER_SECOND
+    WIFI_HOSTNAME
+    WIFI_NO_POWERSAVE
+    WATCHDOG_TIMEOUT_MS
+    DEBUG_LOG
+    TIMEZONE_MODE
+    TIMEZONE_MANUAL_NAME
+    DISPLAY_TIME_MODE
+    TIMEZONE_MOVE_THRESHOLD_KM
+    TIMEZONE_CANDIDATE_COUNT
+)
+
+foreach(def ${OPTIONAL_DEFINES})
+    if(DEFINED ${def})
+        target_compile_definitions(pico_gps_l76k PRIVATE ${def}=${${def}})
+    endif()
+endforeach()
+
+target_link_libraries(pico_gps_l76k
+    pico_stdlib
+    pico_cyw43_arch_lwip_poll
+    pico_multicore
+    pico_sync
+    hardware_pio
+    hardware_dma
+    hardware_i2c
+    hardware_uart
+)
+
+pico_enable_stdio_usb(pico_gps_l76k 1)
+pico_enable_stdio_uart(pico_gps_l76k 0)
+
+pico_add_extra_outputs(pico_gps_l76k)
