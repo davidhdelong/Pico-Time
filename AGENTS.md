@@ -1,5 +1,17 @@
 # Project agent instructions
 
+## GitHub push preference
+
+After completing a project update that changes tracked source, tests,
+configuration, generated data, or documentation, finish the authorized work
+and appropriate validation, summarize the result, and offer to commit and push
+the changes to `https://github.com/davidhdelong/Pico-Time.git`.
+Ask once per completed update, not after each edit or read-only status check.
+If the user already requested a push for that update, complete it without
+asking again and report the resulting commit. Otherwise, wait for the user's
+acceptance before committing and pushing. Keep credentials, private build
+settings, backups, and build artifacts excluded from Git.
+
 ## Firmware and timezone-data build policy
 
 This project is an offline Raspberry Pi Pico 2 W time appliance. GNSS, PPS,
