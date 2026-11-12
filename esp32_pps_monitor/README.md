@@ -184,3 +184,11 @@ Current private firmware SHA-256:
 ## Outage and segmentation fixes — firmware 1.0.2
 
 See [deployment and validation notes](../docs/esp32-monitor-1.0.2-release.md).
+
+## Polling fix — firmware 1.0.3
+
+Manual refreshes and statistics resets now retain one polling timer rather
+than starting additional polling loops. Run `node
+esp32_pps_monitor/tests/test_polling.js` from the parent project directory for
+the scheduling regression test. This image is built but not yet flashed;
+see [build and validation notes](../docs/bug-fixes-0.5.2-release.md).

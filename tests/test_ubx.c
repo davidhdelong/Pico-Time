@@ -54,10 +54,14 @@ int main(void) {
     ubx_parser_init(&parser);
     size_t len = make_frame(0x01, 0x07, payload, sizeof(payload), wire);
     bool complete = false;
+    /* Noise ending in B5 must not supply the valid frame's timestamp. */
+    assert(!ubx_parser_feed(&parser, 0xB5, 10, &frame));
+    assert(!ubx_parser_feed(&parser, 0xB5, 20, &frame));
     for (size_t i = 0; i < len; ++i) {
         if (ubx_parser_feed(&parser, wire[i], 1000 + i, &frame)) complete = true;
     }
     assert(complete);
+    assert(frame.first_byte_ns == 1000);
     assert(ubx_decode_nav_pvt(&frame, &pvt));
     assert(pvt.year == 2026 && pvt.month == 8 && pvt.sec == 56);
     assert(pvt.fix_type == 3 && pvt.satellites == 15);

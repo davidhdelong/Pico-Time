@@ -179,7 +179,7 @@ static esp_err_t health_handler(httpd_req_t *req) {
     pps_monitor_summary(copy, now, &summary);
     cJSON *root = cJSON_CreateObject();
     if (!root) { free(copy); return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Memory unavailable"); }
-    cJSON_AddStringToObject(root, "version", "1.0.2");
+    cJSON_AddStringToObject(root, "version", "1.0.3");
     cJSON_AddStringToObject(root, "device", "ESP32-C6 PPS alignment monitor");
     cJSON_AddNumberToObject(root, "uptime_s", now / 1000000.0);
     cJSON_AddBoolToObject(root, "valid", summary.valid);

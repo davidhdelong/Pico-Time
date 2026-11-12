@@ -50,7 +50,7 @@
 #endif
 
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "0.5.1"
+#define FIRMWARE_VERSION "0.5.2"
 #endif
 
 #if DEBUG_LOG
@@ -796,6 +796,7 @@ static bool hires_time_enabled = false;
 
 typedef struct {
     uint64_t anchor_us;
+    uint64_t last_ns;
     uint32_t anchor_cycles;
 } hires_core_state_t;
 
@@ -1476,9 +1477,12 @@ static bool parse_deg_min(const char *token, const char *hemi, bool is_lat, floa
     if (end == token || *end != '\0' || !isfinite(val) || val < 0.0f) {
         return false;
     }
+    int max_deg = is_lat ? 90 : 180;
+    /* Bound the float before narrowing it; a finite value can still exceed
+     * the representable integer range. */
+    if (val > (float)max_deg * 100.0f) return false;
     int deg = (int)(val / 100.0f);
     float minutes = val - (float)deg * 100.0f;
-    int max_deg = is_lat ? 90 : 180;
     if (deg > max_deg || minutes < 0.0f || minutes >= 60.0f ||
         (deg == max_deg && minutes != 0.0f) ||
         (is_lat && !(hemi[0] == 'N' || hemi[0] == 'S')) ||
@@ -1759,6 +1763,7 @@ static void hires_time_init_core(void) {
     uint32_t save = save_and_disable_interrupts();
     hires_clock_state[core].anchor_us = time_us_64();
     hires_clock_state[core].anchor_cycles = m33_hw->dwt_cyccnt;
+    hires_clock_state[core].last_ns = hires_clock_state[core].anchor_us * 1000ULL;
     restore_interrupts(save);
 #endif
 }
@@ -1774,21 +1779,27 @@ static uint64_t hires_time_ns(void) {
         anchor_us = hires_clock_state[core].anchor_us;
         anchor_cycles = hires_clock_state[core].anchor_cycles;
         cycles = m33_hw->dwt_cyccnt;
-        restore_interrupts(save);
-
         uint32_t delta_cycles = cycles - anchor_cycles;
+        uint64_t result_ns;
         if (delta_cycles >= hires_reanchor_cycles) {
+            /* Sampling and publishing the replacement mapping must be one
+             * operation: UART/PPS ISRs also call this function. */
             uint64_t now_us = time_us_64();
             cycles = m33_hw->dwt_cyccnt;
-            save = save_and_disable_interrupts();
             hires_clock_state[core].anchor_us = now_us;
             hires_clock_state[core].anchor_cycles = cycles;
-            restore_interrupts(save);
-            return now_us * 1000ULL;
+            result_ns = now_us * 1000ULL;
+        } else {
+            uint64_t delta_ns = ((uint64_t)delta_cycles * 1000000000ULL) / hires_cycles_per_sec;
+            result_ns = (anchor_us * 1000ULL) + delta_ns;
         }
-
-        uint64_t delta_ns = ((uint64_t)delta_cycles * 1000000000ULL) / hires_cycles_per_sec;
-        return (anchor_us * 1000ULL) + delta_ns;
+        /* Microsecond quantization of a replacement anchor may briefly put
+         * it behind the last fine-grained sample. Never publish a reversal. */
+        if (result_ns < hires_clock_state[core].last_ns)
+            result_ns = hires_clock_state[core].last_ns;
+        hires_clock_state[core].last_ns = result_ns;
+        restore_interrupts(save);
+        return result_ns;
     }
 #endif
     return time_us_64() * 1000ULL;
@@ -2785,8 +2796,8 @@ static bool parse_gga(char *line, gps_stats_t *stats) {
     }
     stats->fix_quality = fix_quality;
     stats->satellites = satellites;
-    stats->hdop = (fields[8] && *fields[8]) ? strtof(fields[8], NULL) : -1.0f;
-    stats->altitude_m = (fields[9] && *fields[9]) ? strtof(fields[9], NULL) : -1.0f;
+    stats->hdop = gps_number_or_unknown(fields[8], 0.0f);
+    stats->altitude_m = gps_number_or_unknown(fields[9], -FLT_MAX);
 
     stats->has_fix = stats->fix_quality > 0;
     last_gga_update_ns = hires_time_ns();
@@ -2868,13 +2879,13 @@ static bool parse_gsa(char *line, gps_stats_t *stats) {
 
     // PDOP/HDOP/VDOP are typically fields 15/16/17 in GSA.
     if (count > 15 && fields[15] && *fields[15]) {
-        stats->pdop = strtof(fields[15], NULL);
+        stats->pdop = gps_number_or_unknown(fields[15], 0.0f);
     }
     if (count > 16 && fields[16] && *fields[16]) {
-        stats->hdop = strtof(fields[16], NULL);
+        stats->hdop = gps_number_or_unknown(fields[16], 0.0f);
     }
     if (count > 17 && fields[17] && *fields[17]) {
-        stats->vdop = strtof(fields[17], NULL);
+        stats->vdop = gps_number_or_unknown(fields[17], 0.0f);
     }
     return true;
 }

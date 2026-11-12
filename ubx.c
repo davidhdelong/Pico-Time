@@ -55,7 +55,10 @@ bool ubx_parser_feed(ubx_parser_t *parser, uint8_t byte, uint64_t byte_time_ns,
             parser->state = UBX_CLASS;
             parser->ck_a = 0;
             parser->ck_b = 0;
-        } else if (byte != 0xB5u) {
+        } else if (byte == 0xB5u) {
+            /* This byte replaces the preceding possible sync prefix. */
+            parser->first_byte_ns = byte_time_ns;
+        } else {
             parser->state = UBX_SYNC1;
         }
         break;
