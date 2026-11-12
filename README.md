@@ -139,8 +139,8 @@ cause, model assumptions, diagnostics, verification and deployment status.
 
 ## Automatic offline timezone display
 
-The firmware keeps GNSS/PPS, the disciplined clock, NTP, RTC, holdover, and
-leap-second processing in UTC. The display and HTTP dashboard may additionally
+The firmware keeps GNSS/PPS, the disciplined clock, NTP, RTC and holdover
+in UTC. The display and HTTP dashboard may additionally
 show local civil time. By default, a valid GNSS position selects the IANA zone
 from static generated geographic boundaries (`TIMEZONE_MODE=AUTO`), with three
 consecutive candidate results required before changing zones. Lookup is
@@ -200,7 +200,7 @@ cmake .. -DPICO_BOARD=pico2_w -DRTC_SQW_PIN=17
 All compile-time settings defined near the top of `main.c` can be overridden
 with `-DNAME=value` during CMake configuration. This includes GPS quality
 freshness (`GPS_QUALITY_MAX_AGE_MS`, default 3000 ms), RTC SQW thresholds,
-PPS filtering, accuracy-mode thresholds, EEPROM caching, and retry limits.
+PPS filtering, accuracy-mode thresholds, and retry limits.
 
 ## Optional: use I2C1 for RTC
 
@@ -220,6 +220,10 @@ cmake .. -DPICO_BOARD=pico2_w \
   -DWIFI_SSID=\"YourSSID\" -DWIFI_PASSWORD=\"YourPassword\"
 ```
 
+These settings are required. They are stored in the ignored build directory;
+configuration fails before compilation if either setting is missing. Source
+defaults are placeholders and must not be used for a deployable image.
+
 Set a DHCP hostname (default is `ntp1`):
 
 ```
@@ -237,7 +241,7 @@ port.
 
 A hardware watchdog is enabled by default and can be tuned with
 `WATCHDOG_TIMEOUT_MS` (default 8000 ms; accepted range 1–8388 ms, which fits
-both RP2040 and RP2350). RTC/EEPROM I2C transfers have a 20000 us deadline
+both RP2040 and RP2350). RTC I2C transfers have a 20000 us deadline
 (`RTC_I2C_TIMEOUT_US`) and bounded open-drain bus recovery after a timeout.
 
 The HTTP dashboard and SNTP server have no authentication and are intended for
@@ -301,6 +305,15 @@ edge measurement. These fields share the uncertainty snapshot and are unavailabl
 for non-PPS sources or missing/invalid brackets. They do not feed the servo or
 reduce the conservative NTP dispersion. See `docs/pps-placement-diagnostics.md`.
 
+Firmware 0.5.1 maps the PIO counter start to the local clock inside an
+interrupt-masked enable bracket. The first captured counter value establishes
+PPS phase independently of FIFO/DMA processing latency; later pulses retain
+the corrected hardware interval timeline. A lost/stalled capture stream starts
+a fresh counter and requalifies GNSS trust. The enable bracket, input sampling,
+and local clock mapping still have finite uncertainty, so the existing 100 us
+engineering allowance and independent GPIO placement checks remain in force.
+This improves timestamp anchoring; it is not a calibrated UTC accuracy claim.
+
 HTTP has at most two active application connections and retires clients after
 15 seconds without progress. Immutable HTML is transmitted directly from flash
 without a full-page heap copy. A health response owns its snapshot until all TCP
@@ -341,19 +354,20 @@ CRC can be toggled with:
 cmake .. -DPICO_BOARD=pico2_w -DHEALTH_BROADCAST_CRC=1
 ```
 
-## Leap second file
+## UTC time and health fields
 
-If the DS3231 module includes the `AT24C32` EEPROM, the firmware caches parsed
-leap-second metadata there. On boot it loads the cached data from EEPROM and
-only fetches the IANA leap list from the network if the cache is missing,
-invalid, or expired. EEPROM is only rewritten when the parsed leap metadata
-actually changes. The health JSON includes:
-`leap_loaded`, `leap_source`, `leap_valid`, `leap_expire_utc`, `leap_next_utc`,
-and `leap_policy`. The policy is `24h-smear`: SNTP timestamps and the UTC
-display use a linear 24-hour adjustment before the listed leap. GPS NMEA time
-and the RTC remain UTC inputs and are not modified at the hardware boundary.
-This keeps the leap behavior explicit: network-facing time and the display
-follow the smear, while raw GPS/RTC readings remain available for diagnostics.
+Firmware 0.5.0 serves the GNSS receiver's UTC without leap smearing. The
+leap-file network client, EEPROM cache and associated configuration options
+have been removed. Existing EEPROM contents are left untouched and ignored.
+RTC frequency calibration and aging trim still operate independently.
+
+NTP reports LI=0 for synchronized GPS/RTC time and LI=3 when unsynchronized.
+There is no application-generated leap announcement. GNSS UTC interpretation,
+the fixed NTP epoch offset and Gregorian leap-year handling remain in place.
+
+The health API and UDP broadcaster no longer contain `leap_*` fields, and the
+dashboard no longer has a Leap Data section. Consumers using those fields
+must update for 0.5.0. All timing uncertainty and RTC diagnostics are retained.
 
 PPS jitter stats are reported as:
 `pps_jitter_us`, `pps_jitter_min_us`, `pps_jitter_max_us`,
@@ -361,9 +375,6 @@ PPS jitter stats are reported as:
 `pps_jitter_ns`, `pps_jitter_min_ns`, `pps_jitter_max_ns`, and
 `pps_jitter_rms_ns`. The nanosecond values reflect the PPS capture
 counter resolution; the UBX build uses a 50 MHz counter (20 ns ticks).
-
-Leap smear status is reported as:
-`leap_smear` and `leap_smear_remaining_s`.
 
 Additional health fields:
 `uptime_s`, `wifi_link`, `wifi_rssi`, `ip`, `rmc_age_ms`, `rtc_offset_s`,
@@ -386,9 +397,3 @@ When the broadcaster falls back to compact/diagnostic mode, it may also include:
 `rmc_pps_window_us`, `rtc_track_good`, `rtc_track_bad`,
 `health_fmt_drop_count`, `health_alloc_fail_count`, `health_send_err_count`,
 `health_rtc_busy_count`, and `health_compact`.
-
-Disable fetching with:
-
-```
-cmake .. -DPICO_BOARD=pico2_w -DLEAPFILE_ENABLE=0
-```

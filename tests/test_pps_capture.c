@@ -118,6 +118,34 @@ static void fifo_stall(void) {
     assert(!s.rxstall&&stream.count>=9);
     puts("RX FIFO stall stops counter; reset starts a clean capture stream");
 }
+static void first_capture_mapping(void) {
+    /* Execute real assembled instructions, including multiple counter wraps
+     * before any PPS exists. Arrival delay must not change the mapped edge. */
+    const uint64_t rises[] = {7, 99999999, 8589934600ULL, 50000000000ULL};
+    for (unsigned j = 0; j < sizeof(rises)/sizeof(rises[0]); ++j) {
+        machine_t s = {0}; stream_t stream = {0};
+        uint64_t rise = rises[j];
+        run(&s, rise + 20, rise + 1000, rise, 10, &stream);
+        assert(stream.count == 1);
+        for (uint64_t delay = 1000; delay <= 1000000000ULL; delay *= 1000) {
+            uint64_t stamp = 0, rem = 0, start = 123456789ULL;
+            uint64_t expected = start + stream.first.cycle * 10;
+            assert(pps_capture_first_ns(stream.first.ticks, hz, start,
+                                       expected + delay, &stamp, &rem));
+            assert(stamp == expected && rem == 0);
+        }
+    }
+    uint64_t stamp = 42, rem = 17;
+    assert(!pps_capture_first_ns(0, 0, 1, 2, &stamp, &rem));
+    assert(!pps_capture_first_ns(0, hz, 10, 9, &stamp, &rem));
+    assert(!pps_capture_first_ns(UINT32_MAX, hz, 10, 2000000010ULL, &stamp, &rem));
+    assert(stamp == 42 && rem == 17); /* rejection leaves output untouched */
+    assert(pps_capture_first_ns(UINT32_MAX-1u, 30000000, 0, 1000, &stamp, &rem));
+    assert(stamp == 66 && rem == 40000000);
+    stamp += pps_capture_elapsed_ns(UINT32_MAX-1u, UINT32_MAX-11u, 30000000, &rem);
+    assert(stamp == 500 && rem == 0); /* first-edge fraction carries forward */
+    puts("First PPS hardware epoch: real PIO, delayed service, long acquisition and wrap mapping passed");
+}
 static void arithmetic(void) {
     uint32_t div=0;
     assert(pps_capture_divider(150000000,50000000,&div)&&div==384);
@@ -136,4 +164,4 @@ static void arithmetic(void) {
     rem=0;assert(pps_capture_elapsed_ns(UINT32_MAX,0,1,&rem)>0);
     assert(pps_capture_elapsed_ns(100,90,0,&rem)==UINT64_MAX);
 }
-int main(void){arithmetic();transitions_and_wrap();fifo_stall();simulate_day();}
+int main(void){arithmetic();first_capture_mapping();transitions_and_wrap();fifo_stall();simulate_day();}

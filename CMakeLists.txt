@@ -1,5 +1,13 @@
 cmake_minimum_required(VERSION 3.13)
 
+# Source defaults are publishable placeholders; deployment requires private
+# settings in the ignored build cache. Check before SDK/toolchain setup.
+foreach(wifi_setting WIFI_SSID WIFI_PASSWORD)
+    if(NOT DEFINED ${wifi_setting})
+        message(FATAL_ERROR "Set ${wifi_setting} in the private CMake build configuration; see README WiFi config")
+    endif()
+endforeach()
+
 include(pico_sdk_import.cmake)
 
 project(pico_gps_l76k C CXX ASM)
@@ -129,16 +137,6 @@ set(OPTIONAL_DEFINES
     HEALTH_BROADCAST_CRC
     HTTP_SERVER_ENABLE
     HTTP_SERVER_PORT
-    LEAPFILE_ENABLE
-    LEAPFILE_HOST
-    LEAPFILE_PATH
-    LEAPFILE_REFRESH_DAYS
-    LEAPFILE_MAX_BYTES
-    RTC_EEPROM_ENABLE
-    RTC_EEPROM_ADDR
-    RTC_EEPROM_PAGE_SIZE
-    RTC_EEPROM_WRITE_DELAY_MS
-    LEAP_CACHE_EEPROM_OFFSET
     GPS_LINE_QUEUE_SIZE
     HIRES_REANCHOR_US
     RTC_CACHE_POLL_MS

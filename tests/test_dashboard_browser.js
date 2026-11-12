@@ -26,7 +26,6 @@ Object.assign(data, {
     rtc_calibration_required_s:21600, rtc_temperature_valid:true, rtc_temperature_c:23.25, rtc_osf_boot_read:true,
     wifi_link:true, wifi_rssi:-73, ip:'10.254.0.11', uptime_s:1300, version:'0.4.0', build:'Sep 8 2026 12:43:18',
     discipline_mode:'TRACKING', ab_servo_valid:true, ab_period_ns:1000000650, ab_median_ns:1000000660,
-    leap_loaded:true, leap_source:'eeprom', leap_expire_utc:'2027-06-28T00:00:00Z', leap_next_utc:'N/A',
     ubx_sat_total:40, ubx_sat_used:17, ubx_sat_gps:12, ubx_used_gps:8, ubx_sat_galileo:11, ubx_used_galileo:5,
     ubx_sat_beidou:14, ubx_used_beidou:4,
 });

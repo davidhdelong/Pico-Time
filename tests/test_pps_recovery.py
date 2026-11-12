@@ -33,6 +33,7 @@ static void pio_sm_set_enabled(void *p, uint s, bool enabled) {
     if (!enabled) { assert(stage==0); stage=1; }
     else { assert(stage==6); assert(pio0->fdebug==1); pio0->fdebug=0; stage=0; ++resets; }
 }
+static void pps_capture_start(void) { pio_sm_set_enabled(pio0,0,true); }
 static void pio_sm_clear_fifos(void *p,uint s) { (void)p;(void)s;assert(stage==1);stage=2; }
 static void pio_sm_restart(void *p,uint s) { (void)p;(void)s;assert(stage==2);stage=3; }
 static void pio_sm_clkdiv_restart(void *p,uint s) { (void)p;(void)s;assert(stage==3);stage=4; }

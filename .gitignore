@@ -13,3 +13,5 @@ tools/timezone_generator/*.zip
 .env
 .env.*
 !.env.example
+.pio/
+esp32_pps_monitor/sdkconfig.esp32c6

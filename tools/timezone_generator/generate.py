@@ -19,8 +19,8 @@ import zipfile
 
 from shapely.geometry import shape
 
-DEFAULT_URL = "https://github.com/evansiroky/timezone-boundary-builder/releases/download/2026e/timezones-1970.geojson.zip"
-BOUNDARY_VERSION = "2026e"
+DEFAULT_URL = "https://github.com/evansiroky/timezone-boundary-builder/releases/download/2026f/timezones-1970.geojson.zip"
+BOUNDARY_VERSION = "2026f"
 
 
 def tzdb_version() -> str:

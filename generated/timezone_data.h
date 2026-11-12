@@ -3,8 +3,8 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define TZDB_VERSION "2026c"
-#define TZ_BOUNDARY_VERSION "2026e"
+#define TZDB_VERSION "2026e"
+#define TZ_BOUNDARY_VERSION "2026f"
 #define TZ_DATA_START_YEAR 2020
 #define TZ_DATA_END_YEAR 2050
 typedef struct { int32_t lon_e5, lat_e5; } tz_point_t;

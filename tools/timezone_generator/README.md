@@ -2,7 +2,7 @@
 
 This generator consumes the [timezone-boundary-builder](https://github.com/evansiroky/timezone-boundary-builder)
 `timezones-1970.geojson.zip` release and the host IANA tzdb exposed through
-Python `zoneinfo`. The checked build uses release `2026e`, tzdb `2026c`, and
+Python `zoneinfo`. The checked build uses release `2026f`, tzdb `2026e`, and
 generates rules for 2020–2050. Boundary data is derived from OpenStreetMap and
 Natural Earth inputs; see the upstream project for complete licensing and
 attribution. IANA tzdb is public-domain data.

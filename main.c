@@ -28,7 +28,6 @@
 #include "lwip/ip4_addr.h"
 #include "lwip/ip.h"
 #include "lwip/netif.h"
-#include "lwip/dns.h"
 #include "lwip/tcp.h"
 #include "lwip/udp.h"
 #include "lwip/mem.h"
@@ -51,7 +50,7 @@
 #endif
 
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "0.4.0"
+#define FIRMWARE_VERSION "0.5.1"
 #endif
 
 #if DEBUG_LOG
@@ -308,45 +307,15 @@ _Static_assert(RTC_I2C_TIMEOUT_US > 0 && RTC_I2C_TIMEOUT_US <= 100000u,
 
 
 
-#ifndef LEAPFILE_ENABLE
-#define LEAPFILE_ENABLE 1
-#endif
 
-#ifndef LEAPFILE_HOST
-#define LEAPFILE_HOST "data.iana.org"
-#endif
 
-#ifndef LEAPFILE_PATH
-#define LEAPFILE_PATH "/time-zones/tzdb/leap-seconds.list"
-#endif
 
-#ifndef LEAPFILE_REFRESH_DAYS
-#define LEAPFILE_REFRESH_DAYS 28
-#endif
 
-#ifndef LEAPFILE_MAX_BYTES
-#define LEAPFILE_MAX_BYTES 8192
-#endif
 
-#ifndef RTC_EEPROM_ENABLE
-#define RTC_EEPROM_ENABLE 1
-#endif
 
-#ifndef RTC_EEPROM_ADDR
-#define RTC_EEPROM_ADDR 0x57
-#endif
 
-#ifndef RTC_EEPROM_PAGE_SIZE
-#define RTC_EEPROM_PAGE_SIZE 32
-#endif
 
-#ifndef RTC_EEPROM_WRITE_DELAY_MS
-#define RTC_EEPROM_WRITE_DELAY_MS 6
-#endif
 
-#ifndef LEAP_CACHE_EEPROM_OFFSET
-#define LEAP_CACHE_EEPROM_OFFSET 0
-#endif
 
 #ifndef GPS_LINE_QUEUE_SIZE
 #define GPS_LINE_QUEUE_SIZE 8
@@ -668,6 +637,8 @@ static volatile uint32_t pps_capture_faults = 0;
 static uint pps_program_offset;
 static uint64_t pps_capture_remainder;
 static uint64_t pps_capture_last_poll_ns;
+static uint64_t pps_capture_start_ns;
+static bool pps_capture_start_valid;
 #if PPS_CAPTURE_DMA
 #define PPS_DMA_RING_BITS 4u
 #define PPS_DMA_RING_SIZE (1u << PPS_DMA_RING_BITS)
@@ -781,7 +752,6 @@ static int32_t rmc_pps_window_us = RMC_PPS_MAX_OFFSET_US;
 static int32_t rmc_pps_avg_us = 0;
 static int64_t rmc_pps_var_us2 = 0;
 static uint32_t rmc_pps_samples = 0;
-static volatile bool leap_cache_rewrite_pending = false;
 static drift_estimator_t rtc_drift_estimator = {0};
 static drift_estimator_t rtc_phase_estimator = {0};
 #if HEALTH_BROADCAST_ENABLE
@@ -838,32 +808,6 @@ typedef struct {
 
 static gps_line_t gps_line_queue[GPS_LINE_QUEUE_SIZE];
 
-typedef struct {
-    bool loaded;
-    uint32_t expire_ntp;
-    uint32_t next_leap_ntp;
-    int32_t tai_utc;
-    int8_t leap_dir;
-    uint64_t last_fetch_us;
-    uint8_t source;
-} leap_info_t;
-
-#if LEAPFILE_ENABLE
-typedef struct __attribute__((packed)) {
-    uint32_t magic;
-    uint16_t version;
-    uint16_t size;
-    uint32_t crc32;
-    uint32_t expire_ntp;
-    uint32_t next_leap_ntp;
-    int32_t tai_utc;
-    int8_t leap_dir;
-    uint8_t reserved[3];
-} leap_cache_record_t;
-#endif
-
-static leap_info_t g_leap_info = {0};
-
 static struct udp_pcb *sntp_pcb = NULL;
 static bool wifi_driver_ready = false;
 #if HTTP_SERVER_ENABLE
@@ -875,12 +819,6 @@ static struct udp_pcb *health_pcb = NULL;
 
 #define NTP_PORT 123
 #define NTP_DELTA 2208988800UL
-
-enum {
-    LEAP_SOURCE_NONE = 0,
-    LEAP_SOURCE_NETWORK = 1,
-    LEAP_SOURCE_EEPROM = 2,
-};
 
 static const char *clock_state_str(clock_state_t state) {
     switch (state) {
@@ -926,17 +864,6 @@ static const char *rtc_trust_str(rtc_state_t state, bool status, bool sqw_time_v
         return "TRACKING";
     }
     return "PRESENT";
-}
-
-static const char *leap_source_str(uint8_t source) {
-    switch (source) {
-        case LEAP_SOURCE_NETWORK:
-            return "network";
-        case LEAP_SOURCE_EEPROM:
-            return "eeprom";
-        default:
-            return "none";
-    }
 }
 
 static const char *sntp_quality_str(sntp_quality_t quality) {
@@ -1053,19 +980,6 @@ static bool gps_stats_to_adjusted_utc(const gps_stats_t *stats,
     }
     epoch_to_utc(epoch, year, month, day, hour, min, sec);
     return true;
-}
-
-static void format_unix_utc(uint32_t unix_sec, char *out, size_t out_len) {
-    if (!out || out_len == 0) {
-        return;
-    }
-    if (unix_sec == 0) {
-        snprintf(out, out_len, "N/A");
-        return;
-    }
-    int y = 0, mo = 0, d = 0, h = 0, mi = 0, s = 0;
-    epoch_to_utc((int64_t)unix_sec, &y, &mo, &d, &h, &mi, &s);
-    snprintf(out, out_len, "%04d-%02d-%02dT%02d:%02d:%02dZ", y, mo, d, h, mi, s);
 }
 
 static void format_local_time(int64_t unix_sec, char *out, size_t out_len) {
@@ -1206,50 +1120,6 @@ static bool rtc_write_reg(uint8_t reg, uint8_t value) {
     return wrote == 2;
 }
 
-#if LEAPFILE_ENABLE && RTC_EEPROM_ENABLE
-static bool rtc_eeprom_read(uint16_t addr, uint8_t *out, size_t len) {
-    if (!out || len == 0) {
-        return false;
-    }
-    uint8_t addr_buf[2] = {
-        (uint8_t)(addr >> 8),
-        (uint8_t)(addr & 0xFFu),
-    };
-    mutex_enter_blocking(&rtc_i2c_mutex);
-    int wrote = rtc_i2c_write(RTC_EEPROM_ADDR, addr_buf, 2, true);
-    int read = (wrote == 2) ? rtc_i2c_read(RTC_EEPROM_ADDR, out, len, false) : -1;
-    mutex_exit(&rtc_i2c_mutex);
-    return (wrote == 2) && (read == (int)len);
-}
-
-static bool rtc_eeprom_write(uint16_t addr, const uint8_t *data, size_t len) {
-    if (!data || len == 0) {
-        return false;
-    }
-    while (len > 0) {
-        size_t page_off = (size_t)(addr % RTC_EEPROM_PAGE_SIZE);
-        size_t chunk = RTC_EEPROM_PAGE_SIZE - page_off;
-        if (chunk > len) {
-            chunk = len;
-        }
-        uint8_t buf[2 + RTC_EEPROM_PAGE_SIZE];
-        buf[0] = (uint8_t)(addr >> 8);
-        buf[1] = (uint8_t)(addr & 0xFFu);
-        memcpy(buf + 2, data, chunk);
-        mutex_enter_blocking(&rtc_i2c_mutex);
-        int wrote = rtc_i2c_write(RTC_EEPROM_ADDR, buf, chunk + 2, false);
-        mutex_exit(&rtc_i2c_mutex);
-        if (wrote != (int)(chunk + 2)) {
-            return false;
-        }
-        sleep_ms(RTC_EEPROM_WRITE_DELAY_MS);
-        addr = (uint16_t)(addr + chunk);
-        data += chunk;
-        len -= chunk;
-    }
-    return true;
-}
-#endif
 
 static bool rtc_configure_square_wave_1hz(void) {
     uint8_t control = 0;
@@ -1969,13 +1839,6 @@ static bool ubx_frame_pop(ubx_frame_t *out) {
 }
 #endif
 
-static void leap_info_set(const leap_info_t *info) {
-    if (!info) return;
-    mutex_enter_blocking(&stats_mutex);
-    g_leap_info = *info;
-    mutex_exit(&stats_mutex);
-}
-
 typedef struct {
     uint32_t gps_checksum_error_count;
     uint32_t gps_rejected_fix_count;
@@ -2025,12 +1888,6 @@ typedef struct {
     uint32_t rmc_phase_ok_count;
     int32_t rmc_pps_offset_us;
     int32_t rmc_pps_window_us;
-    bool leap_loaded;
-    uint8_t leap_source;
-    uint32_t leap_expire_unix;
-    uint32_t leap_next_unix;
-    bool leap_smear_active;
-    uint32_t leap_smear_remaining_s;
     uint32_t uptime_s;
     int32_t wifi_rssi;
     bool wifi_link;
@@ -2194,27 +2051,6 @@ static void get_health_snapshot(health_snapshot_t *out) {
     jitter_last_ns = pps_jitter_last_ns;
     jitter_ns_sumsq = pps_jitter_ns_sumsq;
     jitter_valid = pps_jitter_valid;
-    out->leap_loaded = g_leap_info.loaded;
-    out->leap_source = g_leap_info.source;
-    out->leap_expire_unix = g_leap_info.expire_ntp ? (g_leap_info.expire_ntp - NTP_DELTA) : 0;
-    out->leap_next_unix = g_leap_info.next_leap_ntp ? (g_leap_info.next_leap_ntp - NTP_DELTA) : 0;
-    if (g_leap_info.loaded && g_leap_info.next_leap_ntp > 0) {
-        uint32_t now_ntp = now_us > 0 ? (uint32_t)(now_us / 1000000ULL + NTP_DELTA) : 0;
-        uint32_t smear_start = (g_leap_info.next_leap_ntp > 86400U)
-            ? (g_leap_info.next_leap_ntp - 86400U)
-            : 0;
-        if (now_ntp > 0 && smear_start > 0 &&
-            now_ntp >= smear_start && now_ntp < g_leap_info.next_leap_ntp) {
-            out->leap_smear_active = true;
-            out->leap_smear_remaining_s = g_leap_info.next_leap_ntp - now_ntp;
-        } else {
-            out->leap_smear_active = false;
-            out->leap_smear_remaining_s = 0;
-        }
-    } else {
-        out->leap_smear_active = false;
-        out->leap_smear_remaining_s = 0;
-    }
     out->rtc_sync_valid = have_rtc_sync;
     out->rtc_sync_age_ms = have_rtc_sync ?
         (absolute_time_diff_us(last_rtc_sync_time, now) / 1000) : -1;
@@ -3331,78 +3167,7 @@ static void sntp_fill_timestamp(uint8_t *buf, uint32_t seconds, uint32_t fractio
     sntp_write_u32(buf + 4, fraction);
 }
 
-static uint32_t ntp_fraction_from_us(uint64_t us) {
-    // Convert microseconds to NTP fraction (2^32 per second).
-    return (uint32_t)((us * 4294967296ULL) / 1000000ULL);
-}
-
-static void apply_leap_smear(uint32_t *seconds, uint32_t *fraction) {
-#if LEAPFILE_ENABLE
-    if (!seconds || !fraction || *seconds == 0) {
-        return;
-    }
-    leap_info_t info;
-    mutex_enter_blocking(&stats_mutex);
-    info = g_leap_info;
-    mutex_exit(&stats_mutex);
-    if (!info.loaded || info.expire_ntp == 0 || info.next_leap_ntp == 0) {
-        return;
-    }
-    if (*seconds >= info.expire_ntp) {
-        return;
-    }
-    const uint64_t smear_window_us = 86400ULL * 1000000ULL;
-    uint64_t now_us = ((uint64_t)(*seconds) * 1000000ULL) +
-                      ((uint64_t)(*fraction) * 1000000ULL / 4294967296ULL);
-    if (info.next_leap_ntp < 86400U) {
-        return;
-    }
-    uint64_t smear_start_ntp = info.next_leap_ntp - 86400U;
-    uint64_t smear_start_us = smear_start_ntp * 1000000ULL;
-    uint64_t smear_end_us = (uint64_t)info.next_leap_ntp * 1000000ULL;
-    if (now_us < smear_start_us || now_us >= smear_end_us) {
-        return;
-    }
-    uint64_t elapsed_us = now_us - smear_start_us;
-    int64_t smear_us = (int64_t)((elapsed_us * 1000000ULL) / smear_window_us);
-    if (info.leap_dir < 0) {
-        smear_us = smear_us;
-    } else {
-        smear_us = -smear_us;
-    }
-    int64_t adj_us = (int64_t)now_us + smear_us;
-    if (adj_us < 0) {
-        return;
-    }
-    uint64_t adj = (uint64_t)adj_us;
-    *seconds = (uint32_t)(adj / 1000000ULL);
-    *fraction = ntp_fraction_from_us(adj % 1000000ULL);
-#endif
-}
-
-static uint8_t get_leap_indicator(uint32_t now_ntp) {
-    uint8_t li = 0;
-#if LEAPFILE_ENABLE
-    leap_info_t info;
-    mutex_enter_blocking(&stats_mutex);
-    info = g_leap_info;
-    mutex_exit(&stats_mutex);
-    if (!info.loaded || info.expire_ntp == 0 || now_ntp == 0) {
-        return 0;
-    }
-    if (now_ntp >= info.expire_ntp) {
-        return 0;
-    }
-    if (info.next_leap_ntp > 0) {
-        uint32_t delta = (info.next_leap_ntp > now_ntp) ? (info.next_leap_ntp - now_ntp) : 0;
-        if (delta > 0 && delta <= 86400U) {
-            li = 1; // insert leap second
-        }
-    }
-#endif
-    return li;
-}
-
+#if HEALTH_BROADCAST_ENABLE && HEALTH_BROADCAST_CRC
 static uint32_t crc32_ieee(const uint8_t *data, size_t len) {
     uint32_t crc = 0xFFFFFFFFu;
     for (size_t i = 0; i < len; ++i) {
@@ -3418,127 +3183,8 @@ static uint32_t crc32_ieee(const uint8_t *data, size_t len) {
     return ~crc;
 }
 
-#if LEAPFILE_ENABLE && RTC_EEPROM_ENABLE
-#define LEAP_CACHE_MAGIC 0x4C454150u
-#define LEAP_CACHE_VERSION 1u
 
-static bool leap_cache_encode(const leap_info_t *info, leap_cache_record_t *rec) {
-    if (!info || !rec || !info->loaded || info->expire_ntp == 0) {
-        return false;
-    }
-    memset(rec, 0, sizeof(*rec));
-    rec->magic = LEAP_CACHE_MAGIC;
-    rec->version = LEAP_CACHE_VERSION;
-    rec->size = (uint16_t)sizeof(*rec);
-    rec->expire_ntp = info->expire_ntp;
-    rec->next_leap_ntp = info->next_leap_ntp;
-    rec->tai_utc = info->tai_utc;
-    rec->leap_dir = info->leap_dir;
-    rec->crc32 = 0;
-    rec->crc32 = crc32_ieee((const uint8_t *)rec, sizeof(*rec));
-    return true;
-}
-
-static bool leap_cache_decode(const leap_cache_record_t *rec, leap_info_t *info) {
-    if (!rec || !info) {
-        return false;
-    }
-    leap_cache_record_t tmp = *rec;
-    uint32_t stored_crc = tmp.crc32;
-    tmp.crc32 = 0;
-    if (tmp.magic != LEAP_CACHE_MAGIC ||
-        tmp.version != LEAP_CACHE_VERSION ||
-        tmp.size != sizeof(tmp) ||
-        stored_crc != crc32_ieee((const uint8_t *)&tmp, sizeof(tmp)) ||
-        tmp.expire_ntp == 0 ||
-        tmp.tai_utc == 0) {
-        return false;
-    }
-    memset(info, 0, sizeof(*info));
-    info->loaded = true;
-    info->expire_ntp = tmp.expire_ntp;
-    info->next_leap_ntp = tmp.next_leap_ntp;
-    info->tai_utc = tmp.tai_utc;
-    info->leap_dir = tmp.leap_dir ? tmp.leap_dir : 1;
-    info->source = LEAP_SOURCE_EEPROM;
-    info->last_fetch_us = time_us_64();
-    return true;
-}
-
-static bool leap_cache_store(const leap_info_t *info) {
-    leap_cache_record_t rec;
-    if (!leap_cache_encode(info, &rec)) {
-        return false;
-    }
-    return rtc_eeprom_write((uint16_t)LEAP_CACHE_EEPROM_OFFSET,
-                            (const uint8_t *)&rec, sizeof(rec));
-}
-
-static bool leap_cache_load(leap_info_t *info) {
-    leap_cache_record_t rec;
-    if (!info) {
-        return false;
-    }
-    if (!rtc_eeprom_read((uint16_t)LEAP_CACHE_EEPROM_OFFSET, (uint8_t *)&rec, sizeof(rec))) {
-        return false;
-    }
-    if (!leap_cache_decode(&rec, info)) {
-        return false;
-    }
-
-    // Older firmware cached the last historical leap as next_leap_ntp.
-    // Never expose a scheduled leap that is already in the past.
-    if (info->next_leap_ntp != 0) {
-        uint32_t now_ntp = 0;
-        if (get_sntp_time_at(hires_time_ns(), &now_ntp, NULL, NULL, NULL) &&
-            now_ntp >= info->next_leap_ntp) {
-            info->next_leap_ntp = 0;
-            leap_cache_rewrite_pending = true;
-        }
-    }
-    return true;
-}
-
-static bool leap_info_same_payload(const leap_info_t *a, const leap_info_t *b) {
-    if (!a || !b) {
-        return false;
-    }
-    return a->loaded == b->loaded &&
-           a->expire_ntp == b->expire_ntp &&
-           a->next_leap_ntp == b->next_leap_ntp &&
-           a->tai_utc == b->tai_utc &&
-           a->leap_dir == b->leap_dir;
-}
-#else
-static bool leap_cache_store(const leap_info_t *info) {
-    (void)info;
-    return false;
-}
-
-static bool leap_cache_load(leap_info_t *info) {
-    (void)info;
-    return false;
-}
-
-static bool leap_info_same_payload(const leap_info_t *a, const leap_info_t *b) {
-    (void)a;
-    (void)b;
-    return false;
-}
 #endif
-
-static bool leap_info_needs_refresh(const leap_info_t *info, uint32_t now_ntp) {
-    if (!info || !info->loaded || info->expire_ntp == 0) {
-        return true;
-    }
-    if (now_ntp == 0) {
-        return false;
-    }
-    uint32_t refresh_lead = (uint32_t)LEAPFILE_REFRESH_DAYS * 86400u;
-    uint32_t refresh_at = info->expire_ntp > refresh_lead
-        ? info->expire_ntp - refresh_lead : 0;
-    return now_ntp >= refresh_at;
-}
 
 static uint64_t get_last_pps_time_ns(void) {
     uint32_t save = save_and_disable_interrupts();
@@ -3688,20 +3334,6 @@ static bool get_sntp_time_details(uint64_t now_ns, uint32_t *seconds, uint32_t *
     if (seconds) *seconds = (uint32_t)(selected.unix_sec + NTP_DELTA);
     if (fraction) *fraction = selected.fraction;
 
-    // Clear legacy cached values that represented the last historical leap
-    // as a future event once a current time sample is available.
-    if (seconds) {
-        mutex_enter_blocking(&stats_mutex);
-        if (g_leap_info.next_leap_ntp != 0 &&
-            *seconds >= g_leap_info.next_leap_ntp) {
-            g_leap_info.next_leap_ntp = 0;
-            leap_cache_rewrite_pending = true;
-        }
-        mutex_exit(&stats_mutex);
-    }
-    if (seconds && fraction) {
-        apply_leap_smear(seconds, fraction);
-    }
     if (synced) *synced = (selected.quality == SNTP_QUALITY_PPS ||
                            selected.quality == SNTP_QUALITY_RTC_SQW);
     if (quality) *quality = selected.quality;
@@ -3765,7 +3397,7 @@ static void sntp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
     bool time_ok_rx = get_sntp_time_details(recv_ns, &ntp_seconds_rx, &ntp_fraction_rx,
         NULL, &rx_quality, &rx_uncertainty, &reference_seconds);
 
-    uint8_t li = time_ok_rx ? get_leap_indicator(ntp_seconds_rx) : 3;
+    uint8_t li = time_ok_rx ? 0u : 3u;
 
     memcpy(resp + 24, orig_ts, sizeof(orig_ts)); // originate timestamp
 
@@ -3776,7 +3408,6 @@ static void sntp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
         /* A historical reference timestamp must not mutate the live source
          * selector or continuity model. */
         if (ref_sec) {
-            apply_leap_smear(&ref_sec, &ref_frac);
             sntp_fill_timestamp(resp + 16, ref_sec, ref_frac);
         }
     }
@@ -3823,260 +3454,6 @@ static void sntp_server_init(void) {
     DBG_PRINTF("SNTP: listening on port %d\n", NTP_PORT);
 }
 
-#if LEAPFILE_ENABLE
-typedef struct {
-    struct tcp_pcb *pcb;
-    bool in_progress;
-    bool dns_pending;
-    uintptr_t attempt;
-    ip_addr_t addr;
-    uint64_t start_us;
-    uint64_t last_attempt_us;
-    size_t len;
-    bool truncated;
-    char buffer[LEAPFILE_MAX_BYTES];
-} leap_fetch_t;
-
-static leap_fetch_t g_leap_fetch = {0};
-
-static void leap_fetch_abort(void) {
-    if (g_leap_fetch.pcb) {
-        tcp_arg(g_leap_fetch.pcb, NULL);
-        tcp_recv(g_leap_fetch.pcb, NULL);
-        tcp_err(g_leap_fetch.pcb, NULL);
-        tcp_close(g_leap_fetch.pcb);
-        g_leap_fetch.pcb = NULL;
-    }
-    g_leap_fetch.in_progress = false;
-    g_leap_fetch.dns_pending = false;
-    g_leap_fetch.len = 0;
-    g_leap_fetch.truncated = false;
-}
-
-static bool leap_parse_file(const char *data, size_t len, uint32_t now_ntp,
-                            leap_info_t *out) {
-    if (!data || !out) return false;
-    leap_info_t info = {0};
-    int32_t prev_tai = 0;
-    bool have_prev = false;
-    uint32_t next_leap_ntp = 0;
-    info.leap_dir = 1;
-    size_t i = 0;
-    while (i < len) {
-        const char *line = data + i;
-        const char *end = memchr(line, '\n', len - i);
-        size_t raw_len = end ? (size_t)(end - line) : (len - i);
-        size_t line_len = raw_len;
-        while (line_len > 0 && (line[line_len - 1] == '\r' || line[line_len - 1] == '\n')) {
-            line_len--;
-        }
-        if (line_len > 0) {
-            if (line[0] == '#') {
-                if (line_len > 2 && line[1] == '@') {
-                    uint32_t exp = 0;
-                    if (sscanf(line + 2, "%" SCNu32, &exp) == 1) {
-                        info.expire_ntp = exp;
-                    }
-                }
-            } else {
-                uint32_t ntp = 0;
-                int tai = 0;
-                if (sscanf(line, "%" SCNu32 " %d", &ntp, &tai) == 2) {
-                    if (have_prev) {
-                        int32_t delta = tai - prev_tai;
-                        if (delta < 0) {
-                            info.leap_dir = -1;
-                        } else if (delta > 0) {
-                            info.leap_dir = 1;
-                        }
-                    }
-                    prev_tai = tai;
-                    have_prev = true;
-                    if (now_ntp != 0 && ntp > now_ntp &&
-                        (next_leap_ntp == 0 || ntp < next_leap_ntp)) {
-                        next_leap_ntp = ntp;
-                    }
-                    info.tai_utc = tai;
-                }
-            }
-        }
-        if (!end) break;
-        i += raw_len + 1;
-    }
-
-    if (!info.expire_ntp || !have_prev || !info.tai_utc) {
-        return false;
-    }
-    info.next_leap_ntp = next_leap_ntp;
-
-    info.loaded = true;
-    info.source = LEAP_SOURCE_NETWORK;
-    info.last_fetch_us = time_us_64();
-    *out = info;
-    return true;
-}
-
-static err_t leap_tcp_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err) {
-    (void)arg;
-    if (err != ERR_OK) {
-        DBG_PRINTF("LEAP: TCP receive error %d\n", (int)err);
-        if (p) pbuf_free(p);
-        leap_fetch_abort();
-        return err;
-    }
-    if (!p) {
-        if (g_leap_fetch.len == 0) {
-            DBG_PRINTF("LEAP: empty HTTP response\n");
-            leap_fetch_abort();
-            return ERR_OK;
-        }
-        g_leap_fetch.buffer[g_leap_fetch.len < LEAPFILE_MAX_BYTES ? g_leap_fetch.len : (LEAPFILE_MAX_BYTES - 1)] = '\0';
-        char *body = strstr(g_leap_fetch.buffer, "\r\n\r\n");
-        char *status_end = strstr(g_leap_fetch.buffer, "\r\n");
-        bool http_ok = strncmp(g_leap_fetch.buffer, "HTTP/1.", 7) == 0 &&
-                       strstr(g_leap_fetch.buffer, " 200 ") != NULL;
-        if (g_leap_fetch.truncated) {
-            DBG_PRINTF("LEAP: response truncated at %u bytes\n",
-                       (unsigned)(LEAPFILE_MAX_BYTES - 1));
-        }
-        if (body && status_end && http_ok) {
-            body += 4;
-            size_t body_len = g_leap_fetch.len - (size_t)(body - g_leap_fetch.buffer);
-            leap_info_t info = {0};
-            uint32_t now_ntp = 0;
-            get_sntp_time_at(hires_time_ns(), &now_ntp, NULL, NULL, NULL);
-            if (leap_parse_file(body, body_len, now_ntp, &info)) {
-                leap_info_t current = {0};
-                mutex_enter_blocking(&stats_mutex);
-                current = g_leap_info;
-                mutex_exit(&stats_mutex);
-                leap_info_set(&info);
-                if (!leap_info_same_payload(&info, &current)) {
-                    if (leap_cache_store(&info)) {
-                        leap_cache_rewrite_pending = false;
-                        DBG_PRINTF("LEAP: cached in RTC EEPROM\n");
-                    } else {
-                        DBG_PRINTF("LEAP: failed to cache in RTC EEPROM\n");
-                    }
-                } else {
-                    DBG_PRINTF("LEAP: unchanged, skipped RTC EEPROM write\n");
-                }
-            } else {
-                DBG_PRINTF("LEAP: file parse failed (HTTP body %u bytes)\n",
-                           (unsigned)body_len);
-            }
-        } else {
-            DBG_PRINTF("LEAP: HTTP response invalid or non-200\n");
-        }
-        leap_fetch_abort();
-        return ERR_OK;
-    }
-
-    struct pbuf *q = p;
-    while (q) {
-        size_t to_copy = q->len;
-        if (g_leap_fetch.len + to_copy >= LEAPFILE_MAX_BYTES) {
-            to_copy = LEAPFILE_MAX_BYTES - g_leap_fetch.len - 1;
-            g_leap_fetch.truncated = true;
-        }
-        if (to_copy > 0) {
-            memcpy(&g_leap_fetch.buffer[g_leap_fetch.len], q->payload, to_copy);
-            g_leap_fetch.len += to_copy;
-        }
-        q = q->next;
-    }
-    tcp_recved(tpcb, p->tot_len);
-    pbuf_free(p);
-    return ERR_OK;
-}
-
-static err_t leap_tcp_connected(void *arg, struct tcp_pcb *tpcb, err_t err) {
-    (void)arg;
-    if (err != ERR_OK) {
-        DBG_PRINTF("LEAP: TCP connect failed %d\n", (int)err);
-        leap_fetch_abort();
-        return err;
-    }
-    char req[256];
-    int req_len = snprintf(req, sizeof(req),
-                           "GET %s HTTP/1.0\r\n"
-                           "Host: %s\r\n"
-                           "User-Agent: pico-gps\r\n"
-                           "Connection: close\r\n\r\n",
-                           LEAPFILE_PATH, LEAPFILE_HOST);
-    if (req_len <= 0) {
-        leap_fetch_abort();
-        return ERR_VAL;
-    }
-    if (tcp_write(tpcb, req, (u16_t)req_len, TCP_WRITE_FLAG_COPY) != ERR_OK || tcp_output(tpcb) != ERR_OK) {
-        leap_fetch_abort();
-        return ERR_MEM;
-    }
-    return ERR_OK;
-}
-
-static void leap_tcp_err(void *arg, err_t err) {
-    (void)arg;
-    (void)err;
-    // lwIP has already released the PCB when this callback runs.
-    g_leap_fetch.pcb = NULL;
-    leap_fetch_abort();
-}
-
-static void leap_dns_cb(const char *name, const ip_addr_t *ipaddr, void *arg) {
-    (void)name;
-    if (!g_leap_fetch.in_progress || !g_leap_fetch.dns_pending ||
-        (uintptr_t)arg != g_leap_fetch.attempt) return;
-    if (!ipaddr) {
-        leap_fetch_abort();
-        return;
-    }
-    g_leap_fetch.addr = *ipaddr;
-    g_leap_fetch.dns_pending = false;
-    g_leap_fetch.pcb = tcp_new_ip_type(IPADDR_TYPE_V4);
-    if (!g_leap_fetch.pcb) {
-        leap_fetch_abort();
-        return;
-    }
-    tcp_arg(g_leap_fetch.pcb, NULL);
-    tcp_recv(g_leap_fetch.pcb, leap_tcp_recv);
-    tcp_err(g_leap_fetch.pcb, leap_tcp_err);
-    if (tcp_connect(g_leap_fetch.pcb, &g_leap_fetch.addr, 80, leap_tcp_connected) != ERR_OK) {
-        leap_fetch_abort();
-    }
-}
-
-static void leap_fetch_start(void) {
-    if (g_leap_fetch.in_progress) return;
-    g_leap_fetch.in_progress = true;
-    g_leap_fetch.dns_pending = true;
-    if (++g_leap_fetch.attempt == 0) ++g_leap_fetch.attempt;
-    g_leap_fetch.len = 0;
-    g_leap_fetch.start_us = time_us_64();
-    g_leap_fetch.last_attempt_us = g_leap_fetch.start_us;
-    ip_addr_t resolved;
-    void *attempt = (void *)g_leap_fetch.attempt;
-    err_t res = dns_gethostbyname(LEAPFILE_HOST, &resolved, leap_dns_cb, attempt);
-    if (res == ERR_OK) {
-        leap_dns_cb(LEAPFILE_HOST, &resolved, attempt);
-    } else if (res == ERR_INPROGRESS) {
-        g_leap_fetch.dns_pending = true;
-    } else {
-        DBG_PRINTF("LEAP: DNS lookup failed (%d)\n", (int)res);
-        leap_fetch_abort();
-    }
-}
-
-static void leap_fetch_poll(void) {
-    if (!g_leap_fetch.in_progress) return;
-    uint64_t now_us = time_us_64();
-    if ((now_us - g_leap_fetch.start_us) > (10 * 1000000ULL)) {
-        DBG_PRINTF("LEAP: fetch timed out%s\n",
-                   g_leap_fetch.dns_pending ? " waiting for DNS" : "");
-        leap_fetch_abort();
-    }
-}
-#endif
 
 #if HEALTH_BROADCAST_ENABLE
 static void health_broadcast_init(void) {
@@ -4116,12 +3493,6 @@ static void health_broadcast_send(void) {
     int64_t pps_age_ms = (snap.last_pps_us >= 0)
         ? (int64_t)((now_us - (uint64_t)snap.last_pps_us) / 1000U)
         : -1;
-    bool leap_valid = (snap.leap_loaded && snap.leap_expire_unix > 0 &&
-                       unix_sec > 0 && unix_sec < snap.leap_expire_unix);
-    char leap_expire_buf[24];
-    char leap_next_buf[24];
-    format_unix_utc(snap.leap_expire_unix, leap_expire_buf, sizeof(leap_expire_buf));
-    format_unix_utc(snap.leap_next_unix, leap_next_buf, sizeof(leap_next_buf));
     uint32_t nonce = __atomic_add_fetch(&health_nonce_counter, 1, __ATOMIC_RELAXED);
 
     char payload[1800];
@@ -4144,14 +3515,7 @@ static void health_broadcast_send(void) {
         "\"alt_m\":%.2f,"
         "\"lat_ok\":%s,"
         "\"lon_ok\":%s,"
-        "\"leap_loaded\":%s,"
-        "\"leap_source\":\"%s\","
-        "\"leap_valid\":%s,"
-        "\"leap_expire_utc\":\"%s\","
-        "\"leap_next_utc\":\"%s\","
         "\"nonce\":%lu,"
-        "\"leap_smear\":%s,"
-        "\"leap_smear_remaining_s\":%lu,"
         "\"uptime_s\":%lu,"
         "\"wifi_link\":%s,"
         "\"wifi_rssi\":%d,"
@@ -4220,14 +3584,7 @@ static void health_broadcast_send(void) {
         (double)snap.stats.altitude_m,
         snap.stats.lat_valid ? "true" : "false",
         snap.stats.lon_valid ? "true" : "false",
-        snap.leap_loaded ? "true" : "false",
-        leap_source_str(snap.leap_source),
-        leap_valid ? "true" : "false",
-        leap_expire_buf,
-        leap_next_buf,
         (unsigned long)nonce,
-        snap.leap_smear_active ? "true" : "false",
-        (unsigned long)snap.leap_smear_remaining_s,
         (unsigned long)snap.uptime_s,
         snap.wifi_link ? "true" : "false",
         (int)snap.wifi_rssi,
@@ -4418,7 +3775,6 @@ static const char http_dashboard[] =
     "<section><h2>Network</h2><dl><dt>IP</dt><dd id=ip>-</dd><dt>Wi-Fi</dt><dd id=wifi>-</dd><dt>RSSI</dt><dd id=rssi>-</dd><dt>Reconnects / failed</dt><dd id=wifiretry>-</dd><dt>NTP requests</dt><dd id=ntpreq>-</dd><dt>NTP rate limited</dt><dd id=ntplimit>-</dd><dt>HTTP requests</dt><dd id=httpreq>-</dd><dt>HTTP errors</dt><dd id=httperr>-</dd></dl></section>"
     "<section><h2>Timezone data</h2><dl><dt>Mode</dt><dd id=tzmode>-</dd><dt>Source</dt><dd id=tzsource>-</dd><dt>Candidate</dt><dd id=tzcandidate>-</dd><dt>Rules</dt><dd id=tzrules>-</dd><dt>IANA / years</dt><dd id=tzdata>-</dd><dt>Boundaries</dt><dd id=tzboundary>-</dd></dl></section>"
     "<section><h2>System</h2><dl><dt>Firmware</dt><dd id=version>-</dd><dt>Build</dt><dd id=build>-</dd><dt>Uptime</dt><dd id=uptime>-</dd><dt>GPS checksum errors</dt><dd id=gpserr>-</dd><dt>Rejected fixes</dt><dd id=reject>-</dd></dl></section>"
-    "<section><h2>Leap Data</h2><dl><dt>Loaded</dt><dd id=leap>-</dd><dt>Source</dt><dd id=leapsrc>-</dd><dt>Expires</dt><dd id=expire>-</dd><dt>Next</dt><dd id=next>-</dd></dl></section>"
     "</div></details><footer>Snapshots every 2 seconds while visible. Polling pauses in background tabs and backs off on errors. NTP: UDP port 123. No external assets or services.</footer></main><script>"
     "const $=id=>document.getElementById(id),v=(id,x)=>{const e=$(id);if(e)e.textContent=x==null?'-':x};let tickBusy=false,timer,lastSuccess=0,failures=0;"
     "async function tick(){if(tickBusy||document.hidden)return;tickBusy=true;const ac=new AbortController(),tm=setTimeout(()=>ac.abort(),5000);try{const r=await fetch('/api/health',{cache:'no-store',signal:ac.signal});if(!r.ok)throw Error('HTTP '+r.status);let d=await r.json();if(!Number.isFinite(d.unix)||!Number.isFinite(d.sntp_stratum))throw Error('Invalid health snapshot');if(document.hidden)return;lastSuccess=Date.now();failures=0;document.body.className='';"
@@ -4441,8 +3797,7 @@ static const char http_dashboard[] =
     "v('phase',d.rtc_sqw_time?(d.rtc_phase_offset_ns/1e6).toFixed(3)+' ms':'Unqualified');v('phase_note',d.rtc_sqw_time?'SQW offset is compensated in software; it is not the NTP time error.':'Waiting for a qualified phase mapping.');v('ip',d.ip);v('wifi',d.wifi_link?'Connected':'Offline');"
     "v('rtc_jitter',(d.rtc_phase_jitter_ns/1000).toFixed(1)+' us');v('rtc_frequency',d.rtc_frequency_valid?d.rtc_frequency_error_ppm.toFixed(3)+' ppm':'Learning');v('rtc_aging',d.rtc_aging_valid?d.rtc_aging+' / '+(d.rtc_aging_enabled?'automatic':'fixed'):'Unread');v('rtc_calibration',d.rtc_calibration_status);v('rtc_learning',(d.rtc_calibration_observed_s/3600).toFixed(1)+' / '+(d.rtc_calibration_required_s/3600).toFixed(1)+' h');v('rtc_writes',d.rtc_calendar_write_count);v('rtc_temperature',d.rtc_temperature_valid?d.rtc_temperature_c.toFixed(2)+' C':'Unavailable');v('rtc_age',d.rtc_holdover_active?d.rtc_holdover_age_s+' s':'Not active');v('rtc_error',d.rtc_holdover_active?(d.rtc_estimated_error_ns/1e6).toFixed(2)+' ms':'Not in holdover');v('rtc_32k',!d.rtc_32k_enabled?'Disabled':d.rtc_32k_valid?'Qualified / '+d.rtc_32k_frequency_error_ppm.toFixed(3)+' ppm':'Learning / '+d.rtc_32k_sample_count+' accepted');v('rtc_osf',d.rtc_osf_boot_read?(d.rtc_osf_at_boot?'Yes':'No'):'Unread');"
     "if(d.rtc_32k_enabled&&!d.rtc_32k_valid&&(d.rtc_32k_age_ms<0||d.rtc_32k_age_ms>2500))v('rtc_32k','No signal');"
-    "v('rssi',d.wifi_rssi+' dBm');v('uptime',Math.floor(d.uptime_s/86400)+'d '+Math.floor(d.uptime_s%86400/3600)+'h '+Math.floor(d.uptime_s%3600/60)+'m');v('leap',d.leap_loaded?'Yes':'No');v('leapsrc',d.leap_source);"
-    "v('expire',d.leap_expire_utc);v('next',d.leap_next_utc);v('version',d.version);v('build',d.build);"
+    "v('rssi',d.wifi_rssi+' dBm');v('uptime',Math.floor(d.uptime_s/86400)+'d '+Math.floor(d.uptime_s%86400/3600)+'h '+Math.floor(d.uptime_s%3600/60)+'m');v('version',d.version);v('build',d.build);"
     "v('gpserr',d.gps_checksum_errors);v('reject',d.gps_rejected_fixes);v('ntpreq',d.sntp_requests);"
     "v('ntplimit',d.sntp_rate_limited);v('httpreq',d.http_requests);v('httperr',d.http_errors);"
     "v('wifiretry',d.wifi_reconnects+' / '+d.wifi_reconnect_failures);"
@@ -4565,11 +3920,7 @@ static int http_build_health_json(char *out, size_t out_len) {
     ntp_uncertainty_t u;
     get_sntp_time_details(hires_time_ns(), &ntp_sec, &ntp_frac, &synced, &quality, &u, NULL);
     uint32_t unix_sec = ntp_sec >= NTP_DELTA ? ntp_sec - NTP_DELTA : 0;
-    char expire[24];
-    char next[24];
     char local[24];
-    format_unix_utc(snap.leap_expire_unix, expire, sizeof(expire));
-    format_unix_utc(snap.leap_next_unix, next, sizeof(next));
     format_local_time(snap.local_unix_sec, local, sizeof(local));
     uint64_t now_us = to_us_since_boot(get_absolute_time());
     int64_t pps_age_ms = snap.last_pps_us >= 0
@@ -4603,7 +3954,6 @@ static int http_build_health_json(char *out, size_t out_len) {
         "\"ab_outlier_threshold_ns\":%llu,\"ab_rejected\":%lu,\"ab_alpha_shift\":%u,\"ab_beta_shift\":%u,"
         "\"rtc_state\":\"%s\",\"rtc_trust\":\"%s\",\"rtc_status\":%s,\"rtc_sqw\":%s,\"rtc_sqw_time\":%s,"
         "\"rtc_sqw_phase_us\":%ld,\"rtc_sqw_rephase_count\":%lu,\"wifi_link\":%s,\"wifi_rssi\":%d,\"ip\":\"%s\",\"uptime_s\":%lu,"
-        "\"leap_loaded\":%s,\"leap_source\":\"%s\",\"leap_expire_utc\":\"%s\",\"leap_next_utc\":\"%s\",\"leap_policy\":\"24h-smear\","
         "\"gps_checksum_errors\":%lu,\"gps_rejected_fixes\":%lu,"
         "\"sntp_requests\":%lu,\"sntp_malformed\":%lu,\"sntp_rate_limited\":%lu,"
         "\"sntp_send_errors\":%lu,\"http_requests\":%lu,\"http_errors\":%lu,"
@@ -4658,7 +4008,6 @@ static int http_build_health_json(char *out, size_t out_len) {
         snap.rtc_sqw_time_valid ? "true" : "false",
         (long)snap.rtc_sqw_phase_us, (unsigned long)snap.rtc_sqw_rephase_count, snap.wifi_link ? "true" : "false",
         (int)snap.wifi_rssi, snap.ip, (unsigned long)snap.uptime_s,
-        snap.leap_loaded ? "true" : "false", leap_source_str(snap.leap_source), expire, next,
         (unsigned long)snap.gps_checksum_error_count,
         (unsigned long)snap.gps_rejected_fix_count,
         (unsigned long)snap.sntp_request_count,
@@ -4995,7 +4344,6 @@ static void pps_pio_irq_handler(void) {
     }
     if (captures > 1 || gps_pps_tick) pps_capture_fault_pending = true;
 #endif
-    last_pps_time_ns = hires_time_ns();
     gps_pps_seen = true;
     gps_pps_tick = true;
 }
@@ -5016,7 +4364,6 @@ static void pps_dma_poll(void) {
     gps_pps_capture_ticks = pps_dma_ring[consumer];
     gps_pps_capture_valid = true;
     pps_dma_consumer = consumer + 1u;
-    last_pps_time_ns = hires_time_ns();
     gps_pps_seen = true;
     gps_pps_tick = true;
 }
@@ -5129,6 +4476,22 @@ static void rtc_sqw_irq_handler(uint gpio, uint32_t events) {
     rtc_sqw_tick = true;
 }
 
+/* Establish the hardware counter epoch while interrupts cannot delay the
+ * enable write. Never use FIFO/DMA processing time as the PPS phase anchor.
+ * The remaining bracket width, divider phase and input synchronization are
+ * covered by the existing conservative uncertainty allowance. */
+static void pps_capture_start(void) {
+    pio_sm_clkdiv_restart(pio0, 0);
+    uint32_t save = save_and_disable_interrupts();
+    uint64_t before_ns = hires_time_ns();
+    pio_sm_set_enabled(pio0, 0, true);
+    __dsb(); /* Complete the peripheral write before closing the bracket. */
+    uint64_t after_ns = hires_time_ns();
+    restore_interrupts(save);
+    pps_capture_start_valid = after_ns >= before_ns && after_ns - before_ns <= 10000u;
+    pps_capture_start_ns = before_ns + (after_ns >= before_ns ? (after_ns - before_ns) / 2u : 0);
+}
+
 static void pps_pio_init(void) {
     PIO pio = pio0;
     uint sm = 0;
@@ -5146,7 +4509,6 @@ static void pps_pio_init(void) {
     sm_config_set_clkdiv_int_frac(&c, (uint16_t)(divider256 >> 8), (uint8_t)divider256);
     pio_sm_set_consecutive_pindirs(pio, sm, GPS_PPS_PIN, 1, false);
     pio_sm_init(pio, sm, offset, &c);
-    pio_sm_set_enabled(pio, sm, true);
 
 #if PPS_CAPTURE_DMA
     pps_dma_channel = dma_claim_unused_channel(true);
@@ -5165,6 +4527,8 @@ static void pps_pio_init(void) {
     irq_set_enabled(PIO0_IRQ_0, true);
     pio_set_irq0_source_enabled(pio, pis_interrupt0, true);
 #endif
+    /* DMA/IRQ consumer must be ready before the producer starts. */
+    pps_capture_start();
 }
 
 /* Main-core only. A stalled counter/backlogged capture stream cannot be
@@ -5229,7 +4593,7 @@ static void pps_capture_service(void) {
 #else
     irq_set_enabled(PIO0_IRQ_0, true);
 #endif
-    pio_sm_set_enabled(pio0, 0, true);
+    pps_capture_start();
 }
 
 static void rtc_sqw_init(void) {
@@ -5285,29 +4649,8 @@ static void core1_entry(void) {
 #if HEALTH_BROADCAST_ENABLE
     uint64_t last_health_us = 0;
 #endif
-    uint64_t last_leap_check_us = 0;
     uint64_t last_wifi_retry_us = time_us_64();
     uint32_t wifi_retry_ms = WIFI_RETRY_MIN_MS;
-#if LEAPFILE_ENABLE
-    uint32_t boot_now_ntp = 0;
-    if (get_sntp_time_at(hires_time_ns(), &boot_now_ntp, NULL, NULL, NULL)) {
-        leap_info_t info;
-        mutex_enter_blocking(&stats_mutex);
-        info = g_leap_info;
-        mutex_exit(&stats_mutex);
-        if (leap_info_needs_refresh(&info, boot_now_ntp)) {
-            leap_fetch_start();
-        }
-    } else {
-        leap_info_t info;
-        mutex_enter_blocking(&stats_mutex);
-        info = g_leap_info;
-        mutex_exit(&stats_mutex);
-        if (!info.loaded) {
-            leap_fetch_start();
-        }
-    }
-#endif
     while (true) {
         cyw43_arch_poll();
         uint64_t wifi_now_us = time_us_64();
@@ -5339,36 +4682,6 @@ static void core1_entry(void) {
             }
         }
         cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, get_led_output() ? 1 : 0);
-#if LEAPFILE_ENABLE
-        #if RTC_EEPROM_ENABLE
-        if (leap_cache_rewrite_pending) {
-            leap_info_t info;
-            mutex_enter_blocking(&stats_mutex);
-            info = g_leap_info;
-            mutex_exit(&stats_mutex);
-            if (leap_cache_store(&info)) {
-                leap_cache_rewrite_pending = false;
-                DBG_PRINTF("LEAP: migrated legacy cache\n");
-            }
-        }
-        #endif
-        leap_fetch_poll();
-        uint64_t now_us = time_us_64();
-        if ((now_us - last_leap_check_us) >= 1000000ULL) {
-            last_leap_check_us = now_us;
-            leap_info_t info;
-            uint32_t now_ntp = 0;
-            bool have_now = get_sntp_time_at(hires_time_ns(), &now_ntp, NULL, NULL, NULL);
-            mutex_enter_blocking(&stats_mutex);
-            info = g_leap_info;
-            mutex_exit(&stats_mutex);
-            if (leap_info_needs_refresh(&info, have_now ? now_ntp : 0)) {
-                if ((now_us - g_leap_fetch.last_attempt_us) >= 60000000ULL) {
-                    leap_fetch_start();
-                }
-            }
-        }
-#endif
 #if HEALTH_BROADCAST_ENABLE
         uint64_t health_now_us = time_us_64();
         if ((health_now_us - last_health_us) >= 1000000ULL) {
@@ -5417,16 +4730,6 @@ int main(void) {
     pps_pio_init();
 tm1637_init();
 
-#if LEAPFILE_ENABLE
-    leap_info_t cached_leap = {0};
-    if (leap_cache_load(&cached_leap)) {
-        leap_info_set(&cached_leap);
-        DBG_PRINTF("LEAP: loaded from RTC EEPROM (expires %lu)\n",
-                   (unsigned long)cached_leap.expire_ntp);
-    } else {
-        DBG_PRINTF("LEAP: no valid RTC EEPROM cache\n");
-    }
-#endif
     rtc_cache_poll();
     update_time_snapshot();
     last_time_snapshot_update = get_absolute_time();
@@ -5496,8 +4799,12 @@ tm1637_init();
                         continue;
                     }
                     pps_ns = prev_pps_time_ns + delta_ns;
-                } else {
-                    pps_capture_remainder = 0;
+                } else if (!capture_valid || !pps_capture_start_valid ||
+                           !pps_capture_first_ns(capture_ticks, PPS_CAPTURE_COUNTER_HZ,
+                               pps_capture_start_ns, now_ns, &pps_ns, &pps_capture_remainder)) {
+                    pps_capture_fault_pending = true;
+                    mutex_exit(&stats_mutex);
+                    continue;
                 }
                 last_pps_time_ns = pps_ns;
                 if (capture_valid) {
@@ -5758,6 +5065,9 @@ tm1637_init();
             (to_us_since_boot(now) - last_pps_local) > (int64_t)PPS_PRESENT_TIMEOUT_US) {
             DBG_PRINTF("GPS PPS lost\n");
             pps_reported = false;
+            /* The next first-capture mapping requires a freshly initialized
+             * X counter, not a counter with previous pulse overhead. */
+            pps_capture_fault_pending = true;
             mutex_enter_blocking(&stats_mutex);            pps_time_valid = false;
             pll_valid = false;
             accuracy_mode = false;

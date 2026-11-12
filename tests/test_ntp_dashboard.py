@@ -26,6 +26,7 @@ for variant in (0, 1):
     bound_ids = set(re.findall(r"(?:v|\$)\('([^']+)'", script))
     assert bound_ids <= set(ids), f"missing DOM elements: {bound_ids-set(ids)}"
     assert "Rephases" not in html
+    assert "Leap Data" not in html and "d.leap_" not in script
     assert "compensated in software" in html
     assert "<details>" in html
     for qualified in (True, False):

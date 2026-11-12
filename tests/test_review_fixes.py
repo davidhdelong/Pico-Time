@@ -1,4 +1,4 @@
-"""Fault injection against the actual I2C and leap-fetch functions in main.c."""
+"""Fault injection against actual bounded I2C functions and watchdog settings."""
 import pathlib
 import subprocess
 import tempfile
@@ -8,8 +8,6 @@ def section(start, end):
     return start + source.split(start, 1)[1].split(end, 1)[0]
 
 i2c = section("static void rtc_i2c_recover(void)", "static bool rtc_write_reg")
-dns = section("static void leap_dns_cb(", "#endif")
-abort = section("static void leap_fetch_abort(void)", "static bool leap_parse_file")
 harness = r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -25,25 +23,7 @@ typedef unsigned uint;
 #define GPIO_OUT 1
 #define RTC_I2C_TIMEOUT_US 20000u
 #define PICO_ERROR_TIMEOUT (-1)
-#define DBG_PRINTF(...) ((void)0)
-#define ERR_OK 0
-#define ERR_INPROGRESS (-5)
-#define IPADDR_TYPE_V4 0
-#define LEAPFILE_HOST "test.invalid"
-typedef int err_t;
-typedef int ip_addr_t;
-struct tcp_pcb { int id; } pcbs[8];
-static struct {
-    struct tcp_pcb *pcb;
-    bool in_progress, dns_pending;
-    uintptr_t attempt;
-    ip_addr_t addr;
-    uint64_t start_us, last_attempt_us;
-    size_t len;
-    bool truncated;
-} g_leap_fetch;
-static uint64_t now;
-static int result, recoveries, elapsed_us, clock_lows, creates, closes, connects;
+static int result, recoveries, elapsed_us, clock_lows;
 static bool stuck_scl;
 static void i2c_deinit(int id) { assert(id==RTC_I2C_ID);++recoveries; }
 static void rtc_init(void) {}
@@ -60,25 +40,6 @@ static int i2c_read_timeout_us(int id,uint8_t address,uint8_t *p,size_t n,bool n
     (void)address;(void)p;(void)n;(void)nostop;assert(id==0&&timeout==20000);return result;
 }
 /* I2C */
-static void tcp_arg(struct tcp_pcb *p,void *arg) { assert(p);(void)arg; }
-static void tcp_recv(struct tcp_pcb *p,void *cb) { assert(p);(void)cb; }
-static void tcp_err(struct tcp_pcb *p,void *cb) { assert(p);(void)cb; }
-static int tcp_close(struct tcp_pcb *p) { assert(p);++closes;return 0; }
-/* ABORT */
-static void *leap_tcp_recv, *leap_tcp_err, *leap_tcp_connected;
-static struct tcp_pcb *tcp_new_ip_type(int type) { assert(type==0);return &pcbs[creates++]; }
-static int tcp_connect(struct tcp_pcb *p,const ip_addr_t *addr,int port,void *cb) {
-    assert(p&&addr&&port==80);(void)cb;++connects;return 0;
-}
-static uint64_t time_us_64(void) { return now; }
-static int dns_result=ERR_INPROGRESS;
-static void (*pending_cb)(const char *,const ip_addr_t *,void *);
-static void *pending_arg;
-static int dns_gethostbyname(const char *name,ip_addr_t *out,
-                            void (*cb)(const char *,const ip_addr_t *,void *),void *arg) {
-    assert(!strcmp(name,LEAPFILE_HOST));*out=7;pending_cb=cb;pending_arg=arg;return dns_result;
-}
-/* DNS */
 int main(void) {
     uint8_t data=0;result=1;
     assert(rtc_i2c_write(0x68,&data,1,false)==1&&!recoveries);
@@ -92,24 +53,9 @@ int main(void) {
     result=-2;assert(rtc_i2c_write(0x68,&data,1,false)==-2&&recoveries==2);
     puts("I2C: deadlines, timeout failure propagation, nine recovery clocks, stuck SCL and retry passed");
 
-    ip_addr_t address=7;
-    leap_fetch_start();void *old=pending_arg;
-    assert(g_leap_fetch.in_progress&&g_leap_fetch.dns_pending);
-    now=10000001;leap_fetch_poll();assert(!g_leap_fetch.in_progress);
-    pending_cb(LEAPFILE_HOST,&address,old);assert(!creates&&!connects);
-    leap_fetch_start();void *current=pending_arg;assert(current!=old);
-    pending_cb(LEAPFILE_HOST,NULL,old);assert(g_leap_fetch.in_progress);
-    pending_cb(LEAPFILE_HOST,&address,old);assert(!creates);
-    pending_cb(LEAPFILE_HOST,&address,current);assert(creates==1&&connects==1&&!g_leap_fetch.dns_pending);
-    pending_cb(LEAPFILE_HOST,&address,current);assert(creates==1);
-    now+=10000001;leap_fetch_poll();assert(closes==1&&!g_leap_fetch.pcb);
-    dns_result=ERR_OK;leap_fetch_start();assert(creates==2&&connects==2);
-    leap_fetch_abort();dns_result=-2;leap_fetch_start();assert(!g_leap_fetch.in_progress&&creates==2);
-    dns_result=ERR_INPROGRESS;leap_fetch_start();pending_cb(LEAPFILE_HOST,NULL,pending_arg);
-    assert(!g_leap_fetch.in_progress);
-    puts("DNS: timeout, stale success/failure, duplicate callback, cached result and failure passed");
+
 }
-'''.replace("/* I2C */", i2c).replace("/* DNS */", dns).replace("/* ABORT */", abort)
+'''.replace("/* I2C */", i2c)
 
 watchdog = section("#ifndef WATCHDOG_TIMEOUT_MS", "#ifndef RTC_I2C_TIMEOUT_US")
 with tempfile.TemporaryDirectory(prefix="pico-review-fixes-") as folder:

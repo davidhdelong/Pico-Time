@@ -18,6 +18,8 @@ harness = r'''
 #define PPS_PLL_MAX_US 1005000ULL
 static bool prev_pps_capture_valid, pps_capture_fault_pending;
 static uint64_t prev_pps_time_ns, pps_capture_remainder;
+static uint64_t pps_capture_start_ns=9000000000ULL;
+static bool pps_capture_start_valid=true;
 static uint32_t prev_pps_capture_ticks;
 static int stats_mutex;
 static void mutex_exit(int *m) { assert(*m==1);*m=0; }
@@ -34,9 +36,10 @@ static bool step(uint32_t capture_ticks, bool capture_valid, uint64_t now_ns) {
     return false;
 }
 int main(void) {
-    uint32_t raw=3000000000u;
+    uint32_t raw=UINT32_MAX-49999999u;
     pps_capture_remainder=17;
-    assert(step(raw,true,10000000000ULL));assert(!pps_capture_remainder);
+    assert(step(raw,true,10123000000ULL));assert(!pps_capture_remainder);
+    assert(prev_pps_time_ns==10000000000ULL); /* 123 ms handling delay removed */
     for(unsigned i=1;i<=60;++i) {
         raw-=49999997u;
         assert(step(raw,true,999999999999ULL));
@@ -49,8 +52,16 @@ int main(void) {
     assert(!step(raw-100u,true,0)); /* extra/glitch edge */
     assert(pps_capture_fault_pending&&prev_pps_time_ns==before&&!stats_mutex);
     prev_pps_capture_valid=false;pps_capture_remainder=7;
-    assert(step(123,true,90000000000ULL));
+    pps_capture_start_ns=89000000000ULL;
+    assert(step(UINT32_MAX-49999999u,true,90321000000ULL));
     assert(prev_pps_time_ns==90000000000ULL&&!pps_capture_remainder);
+    prev_pps_capture_valid=false;before=prev_pps_time_ns;
+    pps_capture_start_valid=false;
+    assert(!step(123,true,91000000000ULL));
+    assert(pps_capture_fault_pending&&prev_pps_time_ns==before&&!stats_mutex);
+    pps_capture_start_valid=true;pps_capture_fault_pending=false;
+    assert(!step(123,false,91000000000ULL));
+    assert(pps_capture_fault_pending&&prev_pps_time_ns==before&&!stats_mutex);
     puts("Actual PPS timeline: corrected intervals, missing/extra edge rejection and fresh anchor passed");
 }
 '''.replace("/* BLOCK */", block)
