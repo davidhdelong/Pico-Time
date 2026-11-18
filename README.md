@@ -1,5 +1,10 @@
 # L76K GPS (Waveshare Pico) reader for Pico 2 W
 
+An initial **ESP32-P4 PoE Ethernet NTP server** port, with separate L76K and
+UBX receiver builds, is available in [esp32_p4_ntp](esp32_p4_ntp/README.md).
+It includes a local dashboard and hardware PPS capture; consult its wiring,
+silicon revision selection and feature limits before flashing.
+
 Reads NMEA sentences from the Waveshare L76K GPS module over UART and prints
 parsed GPS stats (fix, satellites, HDOP, altitude, lat/lon, speed, time/date)
 to the Pico's USB serial (debug) port. The Pico 2 W connects to WiFi via DHCP
